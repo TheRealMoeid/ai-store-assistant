@@ -1,0 +1,30 @@
+{
+  "products": [
+    {
+      "id": "p001",
+      "name": "Jordan 4 x KAWS Cool Grey",
+      "category": "sneakers",
+      "price": 4200000,
+      "description": "Collaboration sneaker with signature KAWS suede overlays and glow-in-the-dark sole.",
+      "variants": [
+        {"size": "40", "color": "cool grey", "material": "leather/suede", "stock": 2},
+        {"size": "41", "color": "cool grey", "material": "leather/suede", "stock": 1},
+        {"size": "42", "color": "cool grey", "material": "leather/suede", "stock": 0},
+        {"size": "43", "color": "cool grey", "material": "leather/suede", "stock": 3}
+      ]
+    },
+    {
+      "id": "p002",
+      "name": "Classic Oversized Hoodie",
+      "category": "clothing",
+      "price": 850000,
+      "description": "Heavyweight cotton fleece hoodie, relaxed fit.",
+      "variants": [
+        {"size": "M", "color": "black", "material": "cotton fleece", "stock": 5},
+        {"size": "L", "color": "black", "material": "cotton fleece", "stock": 4},
+        {"size": "M", "color": "cream", "material": "cotton fleece", "stock": 0},
+        {"size": "L", "color": "cream", "material": "cotton fleece", "stock": 2}
+      ]
+    }
+  ]
+}
