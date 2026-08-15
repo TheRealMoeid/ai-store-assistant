@@ -1,0 +1,34 @@
+[
+  {
+    "role": "user",
+    "content": "/start"
+  },
+  {
+    "role": "assistant",
+    "content": "Hello, welcome to our clothing and sneaker store. How can I help you today?"
+  },
+  {
+    "role": "user",
+    "content": "what do you have?"
+  },
+  {
+    "role": "assistant",
+    "content": "We have two products available: the Jordan 4 x KAWS Cool Grey sneaker and the Classic Oversized Hoodie. Would you like more information about either of these products?"
+  },
+  {
+    "role": "user",
+    "content": "what do you have the Classic Oversized Hoodie??"
+  },
+  {
+    "role": "assistant",
+    "content": "We have the Classic Oversized Hoodie in black (M and L sizes) and cream (only L size). The price is $850,000. Would you like to try one on or add it to your cart?"
+  },
+  {
+    "role": "user",
+    "content": "i want one large in black and one large in cream"
+  },
+  {
+    "role": "assistant",
+    "content": "{\"type\": \"function\", \"name\": \"check_availability\", \"parameters\": {\"color\": \"cream\", \"product_id\": \"p002\", \"size\": \"L\"}}"
+  }
+]
