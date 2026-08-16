@@ -19,7 +19,7 @@ the group's `chat.id` (a negative number) is your `ADMIN_GROUP_ID`.
 
 ### Local development (Ollama)
 Make sure Ollama is running (`ollama serve`) with the model pulled
-(`ollama pull llama3.2`). In `.env`:
+(`ollama pull qwen3:8b`). In `.env`:
 ```
 LLM_PROVIDER=ollama
 ```
