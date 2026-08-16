@@ -5,30 +5,46 @@
   },
   {
     "role": "assistant",
-    "content": "Hello, welcome to our clothing and sneaker store. How can I help you today?"
+    "content": "Hello! 👋 Welcome to our store! How can I assist you today? Are you looking for something specific, or would you like to browse our latest arrivals? 🛍️👟"
   },
   {
     "role": "user",
-    "content": "what do you have?"
+    "content": "what do you have for sale?"
   },
   {
     "role": "assistant",
-    "content": "We have two products available: the Jordan 4 x KAWS Cool Grey sneaker and the Classic Oversized Hoodie. Would you like more information about either of these products?"
+    "content": "We currently have these items available:\n\n👟 **Jordan 4 x KAWS Cool Grey**  \n- Collaborative sneaker with KAWS suede overlays  \n- Available in sizes 40 (2 left), 41 (1 left), and 43 (3 left)  \n\n🧦 **Classic Oversized Hoodie**  \n- Heavyweight cotton fleece in black  \n- Available in sizes M (5 left) and L (4 left)  \n\nWould you like details about a specific item or size? I can check availability for you!"
   },
   {
     "role": "user",
-    "content": "what do you have the Classic Oversized Hoodie??"
+    "content": "Is the Classic Oversized Hoodie only available in black?"
   },
   {
     "role": "assistant",
-    "content": "We have the Classic Oversized Hoodie in black (M and L sizes) and cream (only L size). The price is $850,000. Would you like to try one on or add it to your cart?"
+    "content": "The **Classic Oversized Hoodie** is available in **black** (sizes M and L) and **cream** (sizes M and L).  \n\n- **Black**: M (5 left), L (4 left)  \n- **Cream**: M (out of stock), L (2 left)  \n\nWould you like to check availability for a specific size or color? I can also add it to your cart if you're interested! 😊"
   },
   {
     "role": "user",
-    "content": "i want one large in black and one large in cream"
+    "content": "I want the large size in black and cream"
   },
   {
     "role": "assistant",
-    "content": "{\"type\": \"function\", \"name\": \"check_availability\", \"parameters\": {\"color\": \"cream\", \"product_id\": \"p002\", \"size\": \"L\"}}"
+    "content": "Great! The **Classic Oversized Hoodie** in **large size** (1 unit in **black** and 1 unit in **cream**) has been added to your cart. 🛍️  \n\nWould you like to view your cart, check out, or need help with anything else? 😊"
+  },
+  {
+    "role": "user",
+    "content": "i would like to view my cart"
+  },
+  {
+    "role": "assistant",
+    "content": "Here's what's in your cart:\n\n🧦 **Classic Oversized Hoodie**  \n- **Size**: L  \n- **Color**: Black (1 unit)  \n- **Color**: Cream (1 unit)  \n\nWould you like to proceed to checkout, add more items, or adjust your order? 😊"
+  },
+  {
+    "role": "user",
+    "content": "i would like to checkout"
+  },
+  {
+    "role": "assistant",
+    "content": "Your order has been successfully placed! 🎉  \n**Order ID:** ord_1786881540_648d0e  \n\nPlease send a screenshot of your payment or a transaction ID/reference to confirm the payment and finalize your order. Once we receive it, we'll process your purchase immediately!  \n\nLooking forward to serving you! 😊"
   }
 ]

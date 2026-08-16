@@ -14,9 +14,30 @@ from utils import conversation_manager
 
 logger = logging.getLogger("agent")
 
-MAX_TOOL_ROUNDS = 5
+MAX_TOOL_ROUNDS = 9
 MAX_MALFORMED_RETRIES = 2
 
+# Some smaller/local models occasionally "fake" a tool call by writing JSON
+# as plain reply text instead of using the real function-calling protocol,
+# e.g. {"name":"check_availability","parameters":{"product_id":"..."}} or
+# {"type":"function","name":"...","parameters":{...}}. Key order and extra
+# wrapper keys vary, so we parse structurally rather than regex-matching —
+# and since the intended call is right there, we recover and execute it
+# directly instead of burning another round-trip asking the model to retry.
+def _parse_leaked_json_tool_call(text: str) -> tuple[str, dict] | None:
+    text = text.strip()
+    if not text.startswith("{"):
+        return None
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(obj, dict) or not isinstance(obj.get("name"), str):
+        return None
+    args = obj.get("parameters") if isinstance(obj.get("parameters"), dict) else obj.get("arguments")
+    if not isinstance(args, dict):
+        return None
+    return obj["name"], args
 
 def _parse_native_function_call(failed_generation: str) -> tuple[str, dict] | None:
     """
@@ -116,6 +137,34 @@ async def run_agent(user_id: int, username: str, user_message: str) -> tuple[str
 
         if not choice.tool_calls:
             reply = choice.content or "..."
+
+            parsed = _parse_leaked_json_tool_call(reply)
+            if parsed:
+                name, args = parsed
+                logger.warning("Recovered leaked-JSON tool call from plain text: %s(%s)", name, args)
+                result = call_tool(name, args, user_id, username)
+
+                if name == "place_order" and result.get("status") == "order_placed":
+                    events.append({"type": "order", "data": result["order"]})
+                if name == "log_feedback" and result.get("status") == "logged":
+                    events.append({"type": "feedback", "data": result["feedback"]})
+
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": "recovered_json_1",
+                        "type": "function",
+                        "function": {"name": name, "arguments": json.dumps(args)},
+                    }],
+                })
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": "recovered_json_1",
+                    "content": json.dumps(result, ensure_ascii=False),
+                })
+                continue
+
             logger.info("NO TOOL CALL — model answered directly: %r", reply)
             conversation_manager.save_message(user_id, "assistant", reply)
             return reply, events

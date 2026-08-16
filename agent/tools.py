@@ -104,6 +104,20 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "submit_payment_reference",
+            "description": "Record a payment transaction ID/reference the customer typed after checkout, attaching it to their most recent order awaiting payment.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reference": {"type": "string", "description": "The transaction ID or payment reference text, in the customer's own words."},
+                },
+                "required": ["reference"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "log_feedback",
             "description": "Record a compliment or complaint from the customer.",
             "parameters": {
@@ -224,10 +238,21 @@ def _view_cart(args: dict, ctx: dict) -> dict:
 def _place_order(args: dict, ctx: dict) -> dict:
     cart = _carts.get(ctx["user_id"], [])
     if not cart:
-        return {"error": "cart is empty"}
+        return {
+            "error": "cart is empty",
+            "hint": "You haven't actually called add_to_cart yet — do that first with the item(s) the customer wants, then call place_order again.",
+        }
     order = order_manager.place_order(ctx["user_id"], ctx["username"], cart)
     _carts[ctx["user_id"]] = []
     return {"status": "order_placed", "order": order}
+
+
+def _submit_payment_reference(args: dict, ctx: dict) -> dict:
+    order = order_manager.get_latest_unpaid_order(ctx["user_id"])
+    if not order:
+        return {"error": "no order awaiting payment for this customer"}
+    updated = order_manager.attach_payment_proof(order["order_id"], args["reference"])
+    return {"status": "proof_submitted", "order": updated}
 
 
 def _log_feedback(args: dict, ctx: dict) -> dict:
@@ -242,6 +267,7 @@ _DISPATCH = {
     "add_to_cart": _add_to_cart,
     "view_cart": _view_cart,
     "place_order": _place_order,
+    "submit_payment_reference": _submit_payment_reference,
     "log_feedback": _log_feedback,
 }
 
