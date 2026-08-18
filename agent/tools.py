@@ -203,9 +203,21 @@ def _add_to_cart(args: dict, ctx: dict) -> dict:
             "error": "no such variant exists",
             "hint": f"No '{args['size']}' / '{args['color']}' combo found for '{product['name']}'. Call check_availability to see valid options.",
         }
-    in_stock = any(v["stock"] > 0 for v in variants)
-    if not in_stock:
-        return {"error": "out of stock for that size/color"}
+
+    # Sum stock across every matching variant (color is substring-matched in
+    # check_variant, so more than one row can match) and compare against the
+    # requested quantity — not just "is there at least 1 unit somewhere."
+    requested_qty = args["quantity"]
+    total_stock = sum(v["stock"] for v in variants)
+    if total_stock < requested_qty:
+        return {
+            "error": "insufficient stock",
+            "hint": (
+                f"Only {total_stock} unit(s) of '{product['name']}' available in "
+                f"'{args['size']}' / '{args['color']}', but the customer wants {requested_qty}. "
+                "Tell them how many are actually available and ask if they'd like to adjust the quantity."
+            ),
+        }
 
     cart = _carts.setdefault(ctx["user_id"], [])
 
@@ -214,9 +226,21 @@ def _add_to_cart(args: dict, ctx: dict) -> dict:
     # re-calls add_to_cart for something it already added.
     for item in cart:
         if (item["product_id"], item["size"], item["color"]) == (product["id"], args["size"], args["color"]):
+            combined_qty = item["quantity"] + requested_qty
+            if combined_qty > total_stock:
+                return {
+                    "error": "insufficient stock",
+                    "hint": (
+                        f"'{item['quantity']}' of this item is already in the cart, and adding "
+                        f"{requested_qty} more would need {combined_qty}, but only {total_stock} "
+                        "are available in total. Tell the customer the cart already has some, and "
+                        "how many more (if any) they can add."
+                    ),
+                }
+            item["quantity"] = combined_qty
             return {
                 "status": "already_in_cart",
-                "hint": f"This item is already in the cart with quantity {item['quantity']}. If the customer wants more, that's fine — otherwise no action needed.",
+                "hint": f"This item was already in the cart — quantity increased to {item['quantity']}.",
                 "cart": cart,
             }
 
@@ -225,7 +249,7 @@ def _add_to_cart(args: dict, ctx: dict) -> dict:
             "product_id": product["id"],
             "size": args["size"],
             "color": args["color"],
-            "quantity": args["quantity"],
+            "quantity": requested_qty,
         }
     )
     return {"status": "added", "cart": cart}
@@ -242,6 +266,57 @@ def _place_order(args: dict, ctx: dict) -> dict:
             "error": "cart is empty",
             "hint": "You haven't actually called add_to_cart yet — do that first with the item(s) the customer wants, then call place_order again.",
         }
+
+    # Re-validate every line against *current* stock before touching anything.
+    # Time may have passed since add_to_cart (or other customers may have
+    # bought the same last units), so the stock check at add-time can be
+    # stale. We check the whole cart first and only proceed if every line
+    # still has enough stock — never partially place an order.
+    shortfalls = []
+    for item in cart:
+        variants = inventory_manager.check_variant(item["product_id"], item["size"], item["color"])
+        available = sum(v["stock"] for v in variants)
+        if available < item["quantity"]:
+            shortfalls.append(
+                {
+                    "product_id": item["product_id"],
+                    "size": item["size"],
+                    "color": item["color"],
+                    "requested": item["quantity"],
+                    "available": available,
+                }
+            )
+
+    if shortfalls:
+        return {
+            "error": "stock changed since items were added to cart",
+            "hint": (
+                "One or more cart items no longer have enough stock. Tell the customer "
+                "exactly which item(s) and how many are actually available now, and ask "
+                "them how they'd like to adjust their cart. Do not place the order."
+            ),
+            "shortfalls": shortfalls,
+        }
+
+    # All lines validated — now actually decrement stock for each. If a
+    # decrement unexpectedly fails partway (e.g. a genuine race that slipped
+    # past the check above), we stop immediately rather than placing an
+    # order against stock we couldn't actually reserve.
+    for item in cart:
+        result = inventory_manager.decrement_stock(
+            item["product_id"], item["size"], item["color"], item["quantity"]
+        )
+        if result.get("error"):
+            return {
+                "error": "could not reserve stock while placing order",
+                "hint": (
+                    f"Stock changed unexpectedly while placing the order (item: "
+                    f"{item['product_id']} {item['size']}/{item['color']}). Ask the "
+                    "customer to try again — nothing was charged or finalized."
+                ),
+                "detail": result,
+            }
+
     order = order_manager.place_order(ctx["user_id"], ctx["username"], cart)
     _carts[ctx["user_id"]] = []
     return {"status": "order_placed", "order": order}
