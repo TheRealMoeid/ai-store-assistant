@@ -163,15 +163,15 @@ def _resolve_product_id(raw_id: str) -> tuple[dict | None, dict | None]:
         ),
     }
 
-def _search_products(args: dict, ctx: dict) -> dict:
+async def _search_products(args: dict, ctx: dict) -> dict:
     results = inventory_manager.search_products(args.get("query", ""), args.get("category", ""))
     return {"count": len(results), "products": results}
 
-def _get_product_details(args: dict, ctx: dict) -> dict:
+async def _get_product_details(args: dict, ctx: dict) -> dict:
     product, error = _resolve_product_id(args.get("product_id", ""))
     return product if product else error
 
-def _check_availability(args: dict, ctx: dict) -> dict:
+async def _check_availability(args: dict, ctx: dict) -> dict:
     product, error = _resolve_product_id(args.get("product_id", ""))
     if error:
         return error
@@ -289,19 +289,13 @@ async def _place_order(args: dict, ctx: dict) -> dict:
             "shortfalls": shortfalls,
         }
 
-    # All lines validated — now actually decrement stock for each.
     for item in cart:
-        result = await inventory_manager.decrement_stock(
-            item["product_id"], item["size"], item["color"], item["quantity"]
-        )
+        # Atomically validate and decrement stock for the entire cart at once.
+        result = await inventory_manager.decrement_stock_for_cart(cart)
         if result.get("error"):
             return {
                 "error": "could not reserve stock while placing order",
-                "hint": (
-                    f"Stock changed unexpectedly while placing the order (item: "
-                    f"{item['product_id']} {item['size']}/{item['color']}). Ask the "
-                    "customer to try again — nothing was charged or finalized."
-                ),
+                "hint": f"Stock changed unexpectedly. {result.get('hint', 'Please try adjusting your cart.')}",
                 "detail": result,
             }
 
