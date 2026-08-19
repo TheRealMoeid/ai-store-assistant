@@ -59,7 +59,7 @@ async def handle_payment_screenshot(message: Message, bot: Bot):
 
     # Largest photo size is last in the list
     file_id = message.photo[-1].file_id
-    order_manager.attach_payment_proof(order["order_id"], f"photo:{file_id}")
+    await order_manager.attach_payment_proof(order["order_id"], f"photo:{file_id}")
 
     await message.answer(
         f"Got your payment screenshot for order {order['order_id']} — "

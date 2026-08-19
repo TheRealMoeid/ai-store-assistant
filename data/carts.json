@@ -1,0 +1,10 @@
+{
+  "12345": [
+    {
+      "product_id": "p001",
+      "size": "42",
+      "color": "black",
+      "quantity": 1
+    }
+  ]
+}

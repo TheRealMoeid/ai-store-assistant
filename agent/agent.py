@@ -44,13 +44,31 @@ def _parse_native_function_call(failed_generation: str) -> tuple[str, dict] | No
     Llama sometimes emits its native tag format instead of a structured
     tool call: <function=name{"arg": "val"}</function> or name={"arg":...}
     This recovers (name, args) from that text so we don't have to retry.
+    
+    Uses json.JSONDecoder.raw_decode() to safely extract the JSON object,
+    correctly handling nested braces and escaped characters inside strings.
     """
-    match = re.search(r'<function=([\w_]+)\s*=?\s*(\{.*?\})\s*/?>?', failed_generation, re.DOTALL)
+    # 1. Find the function name and the exact index where the JSON object starts
+    # We look for the opening '{' without trying to match the closing '}'
+    match = re.search(r'<function=([\w_]+)\s*=?\s*\{', failed_generation)
+    if not match:
+        # Fallback for the name={"arg": ...} format
+        match = re.search(r'([\w_]+)\s*=\s*\{', failed_generation)
+        
     if not match:
         return None
-    name, raw_args = match.group(1), match.group(2)
+        
+    name = match.group(1)
+    json_start = match.end() - 1  # The exact index of the opening '{'
+    
+    # 2. Use raw_decode to parse the JSON object starting from that index.
+    # This safely handles nested braces, arrays, and escaped quotes.
+    decoder = json.JSONDecoder()
     try:
-        return name, json.loads(raw_args)
+        args, _ = decoder.raw_decode(failed_generation, json_start)
+        if not isinstance(args, dict):
+            return None
+        return name, args
     except json.JSONDecodeError:
         return None
 
@@ -63,7 +81,7 @@ async def run_agent(user_id: int, username: str, user_message: str) -> tuple[str
     """
     client, model = get_client()
 
-    conversation_manager.save_message(user_id, "user", user_message)
+    conversation_manager.append_messages(user_id, [{"role": "user", "content": user_message}])
     history = conversation_manager.get_recent_for_llm(user_id)
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history]
@@ -88,7 +106,7 @@ async def run_agent(user_id: int, username: str, user_message: str) -> tuple[str
             if parsed:
                 name, args = parsed
                 logger.info("Recovered malformed tool call via regex: %s(%s)", name, args)
-                result = call_tool(name, args, user_id, username)
+                result = await call_tool(name, args, user_id, username)
 
                 if name == "place_order" and result.get("status") == "order_placed":
                     events.append({"type": "order", "data": result["order"]})
@@ -120,7 +138,9 @@ async def run_agent(user_id: int, username: str, user_message: str) -> tuple[str
 
             if malformed_retries > MAX_MALFORMED_RETRIES:
                 fallback = "Sorry, I got a bit confused there — could you rephrase that?"
-                conversation_manager.save_message(user_id, "assistant", fallback)
+                turn_messages = messages[len(history) + 1:]
+                turn_messages.append({"role": "assistant", "content": fallback})
+                conversation_manager.append_messages(user_id, turn_messages)
                 return fallback, events
 
             messages.append({
@@ -140,9 +160,49 @@ async def run_agent(user_id: int, username: str, user_message: str) -> tuple[str
 
             parsed = _parse_leaked_json_tool_call(reply)
             if parsed:
+
+                continue
+
+            # Structural guard: detect commitment language without a tool call.
+            # Models sometimes narrate actions ("I've added that to your cart") 
+            # without actually calling the tool, leaving the cart empty.
+            commitment_phrases = [
+                "i've added", "i have added", "i'll add", "i will add", "let me add",
+                "added to your cart", "added to cart",
+                "order is placed", "order placed", "order is confirmed", "order confirmed",
+                "order is processing", "order processing"
+            ]
+            reply_lower = reply.lower()
+            
+            # Filter out negative contexts so we don't punish the model for saying 
+            # "I haven't added it yet" or "I didn't place the order".
+            is_negative = any(neg in reply_lower for neg in [
+                "not added", "haven't added", "didn't add", 
+                "not placed", "haven't placed", "didn't place",
+                "not confirmed", "haven't confirmed", "didn't confirm"
+            ])
+            
+            if not is_negative and any(phrase in reply_lower for phrase in commitment_phrases):
+                logger.warning("Model narrated action without tool call: %r", reply)
+                # Force a retry by injecting a correction message
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "You claimed to have performed an action (like adding to cart or placing an order) "
+                        "but you didn't actually call the required tool. You MUST call the appropriate tool "
+                        "(e.g., add_to_cart, place_order) instead of just talking about it. Try again now."
+                    )
+                })
+                continue
+                
+                logger.info("NO TOOL CALL — model answered directly: %r", reply)
+                turn_messages = messages[len(history) + 1:]
+                conversation_manager.append_messages(user_id, turn_messages)
+                return reply, events
+        
                 name, args = parsed
                 logger.warning("Recovered leaked-JSON tool call from plain text: %s(%s)", name, args)
-                result = call_tool(name, args, user_id, username)
+                result =await call_tool(name, args, user_id, username)
 
                 if name == "place_order" and result.get("status") == "order_placed":
                     events.append({"type": "order", "data": result["order"]})
@@ -183,7 +243,7 @@ async def run_agent(user_id: int, username: str, user_message: str) -> tuple[str
             except json.JSONDecodeError:
                 args = {}
 
-            result = call_tool(name, args, user_id, username)
+            result = await call_tool(name, args, user_id, username)
             logger.info("TOOL CALL: %s(%s) -> %s", name, args, result)
 
             if name == "place_order" and result.get("status") == "order_placed":
@@ -201,5 +261,7 @@ async def run_agent(user_id: int, username: str, user_message: str) -> tuple[str
 
     # Hit the safety cap — fall back gracefully instead of hanging.
     fallback = "Sorry, I'm having trouble finishing that request — could you try rephrasing?"
-    conversation_manager.save_message(user_id, "assistant", fallback)
+    turn_messages = messages[len(history) + 1:]
+    turn_messages.append({"role": "assistant", "content": fallback})
+    conversation_manager.append_messages(user_id, turn_messages)
     return fallback, events

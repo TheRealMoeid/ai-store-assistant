@@ -16,7 +16,8 @@ CONVERSATIONS_DIR = DATA_DIR / "conversations"
 INVENTORY_FILE = DATA_DIR / "inventory.json"
 ORDERS_FILE = DATA_DIR / "orders.json"
 FEEDBACK_FILE = DATA_DIR / "feedback.json"
-
+CARTS_FILE = DATA_DIR / "carts.json"
+ORDERS_FILE = DATA_DIR / "orders.json"
 # --- Telegram ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID", "0"))

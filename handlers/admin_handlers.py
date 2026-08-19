@@ -30,7 +30,7 @@ async def confirm_order(message: Message, command: CommandObject, bot: Bot):
         return
 
     order_id = command.args.strip()
-    order = order_manager.set_order_status(order_id, "confirmed")
+    order = await order_manager.set_order_status(order_id, "confirmed")
     if not order:
         await message.answer(f"No order found with id {order_id}")
         return

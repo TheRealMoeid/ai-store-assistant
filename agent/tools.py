@@ -2,17 +2,15 @@
 Everything the LLM is allowed to *do*, defined as OpenAI-style function schemas,
 plus the Python implementations behind them.
 
-Carts are kept in memory per user_id (ephemeral — cleared once an order is
-placed). Orders and feedback are persisted via utils/order_manager.py.
+Carts are persisted to disk via utils/cart_manager.py so they survive restarts.
+Orders and feedback are persisted via utils/order_manager.py.
 
 user_id / username are never taken from the model's arguments — they're
 injected by dispatch() from the real Telegram context, so the model can't
 spoof who's ordering.
 """
-from utils import inventory_manager, order_manager
-
-# user_id -> list of {product_id, size, color, quantity}
-_carts: dict[int, list[dict]] = {}
+import json
+from utils import inventory_manager, order_manager, cart_manager
 
 TOOL_SCHEMAS = [
     {
@@ -132,7 +130,6 @@ TOOL_SCHEMAS = [
     },
 ]
 
-
 def _resolve_product_id(raw_id: str) -> tuple[dict | None, dict | None]:
     """
     Looks up a product by id. If that fails, tries treating raw_id as a
@@ -166,16 +163,13 @@ def _resolve_product_id(raw_id: str) -> tuple[dict | None, dict | None]:
         ),
     }
 
-
 def _search_products(args: dict, ctx: dict) -> dict:
     results = inventory_manager.search_products(args.get("query", ""), args.get("category", ""))
     return {"count": len(results), "products": results}
 
-
 def _get_product_details(args: dict, ctx: dict) -> dict:
     product, error = _resolve_product_id(args.get("product_id", ""))
     return product if product else error
-
 
 def _check_availability(args: dict, ctx: dict) -> dict:
     product, error = _resolve_product_id(args.get("product_id", ""))
@@ -191,8 +185,7 @@ def _check_availability(args: dict, ctx: dict) -> dict:
         }
     return {"variants": variants}
 
-
-def _add_to_cart(args: dict, ctx: dict) -> dict:
+async def _add_to_cart(args: dict, ctx: dict) -> dict:
     product, error = _resolve_product_id(args.get("product_id", ""))
     if error:
         return error
@@ -204,9 +197,6 @@ def _add_to_cart(args: dict, ctx: dict) -> dict:
             "hint": f"No '{args['size']}' / '{args['color']}' combo found for '{product['name']}'. Call check_availability to see valid options.",
         }
 
-    # Sum stock across every matching variant (color is substring-matched in
-    # check_variant, so more than one row can match) and compare against the
-    # requested quantity — not just "is there at least 1 unit somewhere."
     requested_qty = args["quantity"]
     total_stock = sum(v["stock"] for v in variants)
     if total_stock < requested_qty:
@@ -219,11 +209,11 @@ def _add_to_cart(args: dict, ctx: dict) -> dict:
             ),
         }
 
-    cart = _carts.setdefault(ctx["user_id"], [])
+    # Load the cart from disk
+    cart = await cart_manager.get_cart(ctx["user_id"])
 
     # If this exact line item is already in the cart, don't add it again —
-    # bump quantity instead. Prevents duplicate entries when the model
-    # re-calls add_to_cart for something it already added.
+    # bump quantity instead.
     for item in cart:
         if (item["product_id"], item["size"], item["color"]) == (product["id"], args["size"], args["color"]):
             combined_qty = item["quantity"] + requested_qty
@@ -238,6 +228,8 @@ def _add_to_cart(args: dict, ctx: dict) -> dict:
                     ),
                 }
             item["quantity"] = combined_qty
+            # Save the updated cart back to disk
+            await cart_manager.set_cart(ctx["user_id"], cart)
             return {
                 "status": "already_in_cart",
                 "hint": f"This item was already in the cart — quantity increased to {item['quantity']}.",
@@ -252,15 +244,18 @@ def _add_to_cart(args: dict, ctx: dict) -> dict:
             "quantity": requested_qty,
         }
     )
+    # Save the new cart state to disk
+    await cart_manager.set_cart(ctx["user_id"], cart)
     return {"status": "added", "cart": cart}
 
+async def _view_cart(args: dict, ctx: dict) -> dict:
+    # Load the cart from disk
+    cart = await cart_manager.get_cart(ctx["user_id"])
+    return {"cart": cart}
 
-def _view_cart(args: dict, ctx: dict) -> dict:
-    return {"cart": _carts.get(ctx["user_id"], [])}
-
-
-def _place_order(args: dict, ctx: dict) -> dict:
-    cart = _carts.get(ctx["user_id"], [])
+async def _place_order(args: dict, ctx: dict) -> dict:
+    # Load the cart from disk
+    cart = await cart_manager.get_cart(ctx["user_id"])
     if not cart:
         return {
             "error": "cart is empty",
@@ -268,10 +263,6 @@ def _place_order(args: dict, ctx: dict) -> dict:
         }
 
     # Re-validate every line against *current* stock before touching anything.
-    # Time may have passed since add_to_cart (or other customers may have
-    # bought the same last units), so the stock check at add-time can be
-    # stale. We check the whole cart first and only proceed if every line
-    # still has enough stock — never partially place an order.
     shortfalls = []
     for item in cart:
         variants = inventory_manager.check_variant(item["product_id"], item["size"], item["color"])
@@ -298,12 +289,9 @@ def _place_order(args: dict, ctx: dict) -> dict:
             "shortfalls": shortfalls,
         }
 
-    # All lines validated — now actually decrement stock for each. If a
-    # decrement unexpectedly fails partway (e.g. a genuine race that slipped
-    # past the check above), we stop immediately rather than placing an
-    # order against stock we couldn't actually reserve.
+    # All lines validated — now actually decrement stock for each.
     for item in cart:
-        result = inventory_manager.decrement_stock(
+        result = await inventory_manager.decrement_stock(
             item["product_id"], item["size"], item["color"], item["quantity"]
         )
         if result.get("error"):
@@ -317,23 +305,23 @@ def _place_order(args: dict, ctx: dict) -> dict:
                 "detail": result,
             }
 
-    order = order_manager.place_order(ctx["user_id"], ctx["username"], cart)
-    _carts[ctx["user_id"]] = []
+    order = await order_manager.place_order(ctx["user_id"], ctx["username"], cart)
+    
+    # Clear the cart on disk since the order is placed
+    await cart_manager.set_cart(ctx["user_id"], [])
+    
     return {"status": "order_placed", "order": order}
 
-
-def _submit_payment_reference(args: dict, ctx: dict) -> dict:
+async def _submit_payment_reference(args: dict, ctx: dict) -> dict:
     order = order_manager.get_latest_unpaid_order(ctx["user_id"])
     if not order:
         return {"error": "no order awaiting payment for this customer"}
-    updated = order_manager.attach_payment_proof(order["order_id"], args["reference"])
+    updated = await order_manager.attach_payment_proof(order["order_id"], args["reference"])
     return {"status": "proof_submitted", "order": updated}
 
-
-def _log_feedback(args: dict, ctx: dict) -> dict:
-    entry = order_manager.log_feedback(ctx["user_id"], ctx["username"], args["kind"], args["message"])
+async def _log_feedback(args: dict, ctx: dict) -> dict:
+    entry = await order_manager.log_feedback(ctx["user_id"], ctx["username"], args["kind"], args["message"])
     return {"status": "logged", "feedback": entry}
-
 
 _DISPATCH = {
     "search_products": _search_products,
@@ -346,14 +334,14 @@ _DISPATCH = {
     "log_feedback": _log_feedback,
 }
 
-
-def call_tool(name: str, args: dict, user_id: int, username: str) -> dict:
+async def call_tool(name: str, args: dict, user_id: int, username: str) -> dict:
     ctx = {"user_id": user_id, "username": username}
     fn = _DISPATCH.get(name)
     if not fn:
         return {"error": f"unknown tool '{name}'"}
     try:
-        return fn(args, ctx)
+        # We await here because some tools (like place_order) are now async
+        return await fn(args, ctx)
     except KeyError as e:
         return {"error": f"missing required argument: {e}"}
     except Exception as e:

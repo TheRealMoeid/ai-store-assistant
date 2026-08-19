@@ -1,0 +1,45 @@
+[
+  {
+    "role": "user",
+    "content": "Message 1"
+  },
+  {
+    "role": "assistant",
+    "content": "Reply 1"
+  },
+  {
+    "role": "user",
+    "content": "Message 2"
+  },
+  {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+      {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+          "name": "search",
+          "arguments": "{}"
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "tool_call_id": "call_1",
+    "content": "Result 1"
+  },
+  {
+    "role": "assistant",
+    "content": "Reply 2"
+  },
+  {
+    "role": "user",
+    "content": "Message 3"
+  },
+  {
+    "role": "assistant",
+    "content": "Reply 3"
+  }
+]
