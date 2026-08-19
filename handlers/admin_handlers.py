@@ -11,14 +11,17 @@ router = Router()
 
 @router.message(Command("pending_orders"))
 async def pending_orders(message: Message):
-    with open(config.ORDERS_FILE, "r", encoding="utf-8") as f:
-        orders = json.load(f)
+    # Use the new safe, locked read function instead of direct file access
+    orders = await order_manager.get_all_orders()
+    
     pending = [o for o in orders if o["status"] in ("pending_confirmation", "awaiting_review")]
     if not pending:
         await message.answer("No pending orders.")
         return
+    
     text = "\n\n".join(
-        f"{o['order_id']} — @{o['username']} — {len(o['items'])} item(s) — {o['status']}" for o in pending
+        f"{o['order_id']} — @{o['username']} — {len(o['items'])} item(s) — {o['status']}" 
+        for o in pending
     )
     await message.answer(text)
 

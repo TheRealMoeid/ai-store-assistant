@@ -1,3 +1,11 @@
+"""
+Orders and feedback are append-only JSON logs (no DB, per project requirements).
+Each write reads the whole file, appends, and writes back — fine at this scale.
+Admin group notification happens one layer up (agent.py has the bot instance).
+
+Order status lifecycle:
+  pending_confirmation -> awaiting_review (payment proof submitted) -> confirmed | rejected
+"""
 import json
 import secrets
 import asyncio
@@ -9,8 +17,12 @@ _orders_lock = asyncio.Lock()
 _feedback_lock = asyncio.Lock()
 
 def _load(path) -> list[dict]:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    """Safely loads JSON, returning an empty list if the file doesn't exist yet."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return []
 
 def _save(path, records: list[dict]):
     with open(path, "w", encoding="utf-8") as f:
@@ -68,6 +80,14 @@ async def set_order_status(order_id: str, status: str) -> dict | None:
                 _save(config.ORDERS_FILE, records)
                 return o
         return None
+
+async def get_all_orders() -> list[dict]:
+    """
+    Safely reads all orders, protected by the lock to prevent reading 
+    a partially written file if a write operation is happening at the exact same moment.
+    """
+    async with _orders_lock:
+        return _load(config.ORDERS_FILE)
 
 async def log_feedback(user_id: int, username: str, kind: str, message: str) -> dict:
     entry = {

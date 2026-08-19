@@ -54,5 +54,13 @@
   {
     "role": "assistant",
     "content": "Your order has been successfully placed! 🎉  \n\n📄 **Order ID**: ord_1786807408_663279  \n🛒 **Items**: 1 x Jordan 4 x KAWS Cool Grey (Size: 43)  \n🚚 **Shipping**: Expected within 2-5 business days via standard delivery.  \n\nYou'll receive a confirmation email with tracking details soon! Let me know if you need anything else. 😊"
+  },
+  {
+    "role": "user",
+    "content": "/admin"
+  },
+  {
+    "role": "user",
+    "content": "/admin"
   }
 ]
