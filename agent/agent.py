@@ -193,7 +193,7 @@ async def run_agent(user_id: int, username: str, user_message: str) -> tuple[str
                         "(e.g., add_to_cart, place_order) instead of just talking about it. Try again now."
                     )
                 })
-                continue
+                
                 
                 logger.info("NO TOOL CALL — model answered directly: %r", reply)
                 turn_messages = messages[len(history) + 1:]
@@ -226,7 +226,7 @@ async def run_agent(user_id: int, username: str, user_message: str) -> tuple[str
                 continue
 
             logger.info("NO TOOL CALL — model answered directly: %r", reply)
-            conversation_manager.save_message(user_id, "assistant", reply)
+            conversation_manager.append_messages(user_id, [{"role": "assistant", "content": reply}])
             return reply, events
 
         # Successful structured tool call — reset the malformed-retry counter.
