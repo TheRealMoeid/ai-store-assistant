@@ -243,4 +243,6 @@ If you wish to extend or modify the project, follow these guidelines:
 
 ## 14. License
 
-No license is specified in this repository. All rights are reserved by the author.
+This project is licensed under the [MIT License](LICENSE).
+
+See the [LICENSE](LICENSE) file for the full license text.
