@@ -22,6 +22,17 @@ ORDERS_FILE = DATA_DIR / "orders.json"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID", "0"))
 
+# Optional: comma-separated Telegram user IDs allowed to run admin commands
+# from a private chat with the bot, in addition to the admin group itself.
+# e.g. ADMIN_USER_IDS=111111111,222222222
+# Non-numeric entries (e.g. a stray trailing comment) are skipped rather
+# than crashing startup.
+ADMIN_USER_IDS = {
+    int(uid.strip())
+    for uid in os.getenv("ADMIN_USER_IDS", "").split(",")
+    if uid.strip().lstrip("-").isdigit()
+}
+
 # --- LLM provider ---
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").lower()  # "ollama" | "groq"
 
