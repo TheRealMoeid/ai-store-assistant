@@ -81,6 +81,32 @@ async def set_order_status(order_id: str, status: str) -> dict | None:
                 return o
         return None
 
+async def set_order_status_if_not(order_id: str, status: str, forbidden_current_status: str) -> tuple[dict | None, bool]:
+    """
+    Atomically transitions order_id to `status`, unless its current status
+    already equals `forbidden_current_status` — in which case it's left
+    untouched. Returns (order, transitioned):
+      - order is None if no order with that id exists.
+      - transitioned is True only if this call actually changed the status.
+
+    Exists so a caller can tell "I just performed this transition" apart
+    from "this was already done" under concurrent calls (e.g. two /reject
+    commands for the same order_id landing at nearly the same time), without
+    a separate read-then-write race. Used by /reject so stock restoration
+    (utils/inventory_manager.restore_stock_for_order) only ever runs once
+    per order, even if the admin taps /reject twice.
+    """
+    async with _orders_lock:
+        records = _load(config.ORDERS_FILE)
+        for o in records:
+            if o["order_id"] == order_id:
+                if o["status"] == forbidden_current_status:
+                    return o, False
+                o["status"] = status
+                _save(config.ORDERS_FILE, records)
+                return o, True
+        return None, False
+
 async def get_all_orders() -> list[dict]:
     """
     Safely reads all orders, protected by the lock to prevent reading 

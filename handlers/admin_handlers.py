@@ -7,7 +7,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import Message, TelegramObject
 
 import config
-from utils import order_manager
+from utils import order_manager, inventory_manager
 
 logger = logging.getLogger("admin_handlers")
 
@@ -100,12 +100,38 @@ async def reject_order(message: Message, command: CommandObject, bot: Bot):
         return
 
     order_id = command.args.strip()
-    order = await order_manager.set_order_status(order_id, "rejected")
+
+    # Atomic check-and-set: only the call that actually flips the status to
+    # "rejected" is allowed to restore stock. A second /reject on an
+    # already-rejected order (double tap, retry, etc.) is a safe no-op
+    # instead of crediting stock back twice. See Issue #4.
+    order, transitioned = await order_manager.set_order_status_if_not(order_id, "rejected", "rejected")
     if not order:
         await message.answer(f"No order found with id {order_id}")
         return
 
-    await message.answer(f"❌ {order_id} rejected.")
+    if not transitioned:
+        await message.answer(f"{order_id} was already rejected — no changes made.")
+        return
+
+    restore_result = await inventory_manager.restore_stock_for_order(order_id)
+
+    reply_lines = [f"❌ {order_id} rejected."]
+    if restore_result.get("error"):
+        # Order existed a moment ago (we just transitioned its status) so this
+        # shouldn't normally happen, but don't let a lookup hiccup hide the
+        # fact that stock wasn't restored.
+        logger.warning("Stock restoration failed for %s: %s", order_id, restore_result["error"])
+        reply_lines.append(f"⚠️ Could not restore stock: {restore_result['error']}")
+    else:
+        for item in restore_result.get("skipped", []):
+            reply_lines.append(
+                f"⚠️ Could not restore stock for {item.get('product_id')} "
+                f"({item.get('size')}/{item.get('color')}) — that variant no longer "
+                f"exists in inventory. Please adjust stock manually if needed."
+            )
+
+    await message.answer("\n".join(reply_lines))
     await bot.send_message(
         order["user_id"],
         f"Your order {order_id} couldn't be confirmed — please contact us if you believe this is a mistake.",
