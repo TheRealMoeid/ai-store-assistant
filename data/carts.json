@@ -1,18 +1,1 @@
-{
-  "12345": [
-    {
-      "product_id": "p001",
-      "size": "42",
-      "color": "black",
-      "quantity": 1
-    }
-  ],
-  "7409289878": [
-    {
-      "product_id": "p001",
-      "size": "40",
-      "color": "cool grey",
-      "quantity": 1
-    }
-  ]
-}
+{}

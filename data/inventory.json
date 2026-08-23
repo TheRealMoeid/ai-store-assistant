@@ -7,10 +7,42 @@
       "price": 4200000,
       "description": "Collaboration sneaker with signature KAWS suede overlays and glow-in-the-dark sole.",
       "variants": [
-        {"size": "40", "color": "cool grey", "material": "leather/suede", "stock": 2},
-        {"size": "41", "color": "cool grey", "material": "leather/suede", "stock": 1},
-        {"size": "42", "color": "cool grey", "material": "leather/suede", "stock": 0},
-        {"size": "43", "color": "cool grey", "material": "leather/suede", "stock": 3}
+        {
+          "size": "40",
+          "color": "cool grey",
+          "material": "leather/suede",
+          "stock": 24
+        },
+        {
+          "size": "41",
+          "color": "cool grey",
+          "material": "leather/suede",
+          "stock": 5
+        },
+        {
+          "size": "42",
+          "color": "cool grey",
+          "material": "leather/suede",
+          "stock": 1
+        },
+        {
+          "size": "43",
+          "color": "cool grey",
+          "material": "leather/suede",
+          "stock": 10
+        },
+        {
+          "size": "44",
+          "color": "cool grey",
+          "material": "leather/suede",
+          "stock": 0
+        },
+        {
+          "size": "45",
+          "color": "cool grey",
+          "material": "leather/suede",
+          "stock": 99
+        }
       ]
     },
     {
@@ -20,10 +52,30 @@
       "price": 850000,
       "description": "Heavyweight cotton fleece hoodie, relaxed fit.",
       "variants": [
-        {"size": "M", "color": "black", "material": "cotton fleece", "stock": 5},
-        {"size": "L", "color": "black", "material": "cotton fleece", "stock": 4},
-        {"size": "M", "color": "cream", "material": "cotton fleece", "stock": 0},
-        {"size": "L", "color": "cream", "material": "cotton fleece", "stock": 2}
+        {
+          "size": "M",
+          "color": "black",
+          "material": "cotton fleece",
+          "stock": 6
+        },
+        {
+          "size": "L",
+          "color": "black",
+          "material": "cotton fleece",
+          "stock": 6
+        },
+        {
+          "size": "M",
+          "color": "cream",
+          "material": "cotton fleece",
+          "stock": 6
+        },
+        {
+          "size": "L",
+          "color": "cream",
+          "material": "cotton fleece",
+          "stock": 6
+        }
       ]
     }
   ]
