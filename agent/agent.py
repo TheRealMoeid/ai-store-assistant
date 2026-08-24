@@ -159,8 +159,32 @@ async def run_agent(user_id: int, username: str, user_message: str) -> tuple[str
             reply = choice.content or "..."
 
             parsed = _parse_leaked_json_tool_call(reply)
-            if parsed:
 
+            if parsed:
+                name, args = parsed
+                logger.warning("Recovered leaked-JSON tool call from plain text: %s(%s)", name, args)
+                result = await call_tool(name, args, user_id, username)
+
+                if name == "place_order" and result.get("status") == "order_placed":
+                    events.append({"type": "order", "data": result["order"]})
+                if name == "log_feedback" and result.get("status") == "logged":
+                    events.append({"type": "feedback", "data": result["feedback"]})
+
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": "recovered_json_1",
+                        "type": "function",
+                        "function": {"name": name, "arguments": json.dumps(args)},
+                    }],
+                })
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": "recovered_json_1",
+                    "content": json.dumps(result, ensure_ascii=False),
+                })
+                malformed_retries = 0  # successful recovery, don't count it against the cap
                 continue
 
             # Structural guard: detect commitment language without a tool call.
@@ -199,31 +223,6 @@ async def run_agent(user_id: int, username: str, user_message: str) -> tuple[str
                 turn_messages = messages[len(history) + 1:]
                 conversation_manager.append_messages(user_id, turn_messages)
                 return reply, events
-        
-                name, args = parsed
-                logger.warning("Recovered leaked-JSON tool call from plain text: %s(%s)", name, args)
-                result =await call_tool(name, args, user_id, username)
-
-                if name == "place_order" and result.get("status") == "order_placed":
-                    events.append({"type": "order", "data": result["order"]})
-                if name == "log_feedback" and result.get("status") == "logged":
-                    events.append({"type": "feedback", "data": result["feedback"]})
-
-                messages.append({
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [{
-                        "id": "recovered_json_1",
-                        "type": "function",
-                        "function": {"name": name, "arguments": json.dumps(args)},
-                    }],
-                })
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": "recovered_json_1",
-                    "content": json.dumps(result, ensure_ascii=False),
-                })
-                continue
 
             logger.info("NO TOOL CALL — model answered directly: %r", reply)
             conversation_manager.append_messages(user_id, [{"role": "assistant", "content": reply}])
