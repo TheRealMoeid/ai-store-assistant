@@ -93,7 +93,7 @@ async def run_agent(user_id: int, username: str, user_message: str) -> tuple[str
             response = await client.chat.completions.create(
                 model=model,
                 messages=messages,
-                tools=TOOL_SCHEMAS,
+                tools=TOOL_SCHEMAS, # type: ignore
                 tool_choice="auto", # you may already have this implicitly — make it explicit
                 parallel_tool_calls=False,  # simpler for Llama/Groq — fewer malformed multi-calls
             )
@@ -236,9 +236,9 @@ async def run_agent(user_id: int, username: str, user_message: str) -> tuple[str
         messages.append(choice.model_dump(exclude_unset=True))
 
         for tool_call in choice.tool_calls:
-            name = tool_call.function.name
+            name = tool_call.function.name #type: ignore
             try:
-                args = json.loads(tool_call.function.arguments or "{}")
+                args = json.loads(tool_call.function.arguments or "{}") # type: ignore
             except json.JSONDecodeError:
                 args = {}
 

@@ -169,19 +169,19 @@ async def _search_products(args: dict, ctx: dict) -> dict:
 
 async def _get_product_details(args: dict, ctx: dict) -> dict:
     product, error = _resolve_product_id(args.get("product_id", ""))
-    return product if product else error
+    return product if product else error # type: ignore
 
 async def _check_availability(args: dict, ctx: dict) -> dict:
     product, error = _resolve_product_id(args.get("product_id", ""))
     if error:
         return error
     variants = inventory_manager.check_variant(
-        product["id"], args.get("size", ""), args.get("color", "")
+        product["id"], args.get("size", ""), args.get("color", "") # type: ignore
     )
     if not variants:
         return {
             "variants": [],
-            "hint": f"No variants matched that size/color for '{product['name']}'. Try omitting size or color to see all options.",
+            "hint": f"No variants matched that size/color for '{product['name']}'. Try omitting size or color to see all options.", # pyright: ignore[reportOptionalSubscript]
         }
     return {"variants": variants}
 
@@ -190,11 +190,11 @@ async def _add_to_cart(args: dict, ctx: dict) -> dict:
     if error:
         return error
 
-    variants = inventory_manager.check_variant(product["id"], args["size"], args["color"])
+    variants = inventory_manager.check_variant(product["id"], args["size"], args["color"]) # type: ignore
     if not variants:
         return {
             "error": "no such variant exists",
-            "hint": f"No '{args['size']}' / '{args['color']}' combo found for '{product['name']}'. Call check_availability to see valid options.",
+            "hint": f"No '{args['size']}' / '{args['color']}' combo found for '{product['name']}'. Call check_availability to see valid options.", # type: ignore
         }
 
     requested_qty = args["quantity"]
@@ -203,7 +203,7 @@ async def _add_to_cart(args: dict, ctx: dict) -> dict:
         return {
             "error": "insufficient stock",
             "hint": (
-                f"Only {total_stock} unit(s) of '{product['name']}' available in "
+                f"Only {total_stock} unit(s) of '{product['name']}' available in " # type: ignore
                 f"'{args['size']}' / '{args['color']}', but the customer wants {requested_qty}. "
                 "Tell them how many are actually available and ask if they'd like to adjust the quantity."
             ),
@@ -215,7 +215,7 @@ async def _add_to_cart(args: dict, ctx: dict) -> dict:
     # If this exact line item is already in the cart, don't add it again —
     # bump quantity instead.
     for item in cart:
-        if (item["product_id"], item["size"], item["color"]) == (product["id"], args["size"], args["color"]):
+        if (item["product_id"], item["size"], item["color"]) == (product["id"], args["size"], args["color"]): # type: ignore
             combined_qty = item["quantity"] + requested_qty
             if combined_qty > total_stock:
                 return {
@@ -238,7 +238,7 @@ async def _add_to_cart(args: dict, ctx: dict) -> dict:
 
     cart.append(
         {
-            "product_id": product["id"],
+            "product_id": product["id"], # type: ignore
             "size": args["size"],
             "color": args["color"],
             "quantity": requested_qty,
