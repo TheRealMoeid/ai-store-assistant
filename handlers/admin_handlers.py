@@ -1,5 +1,6 @@
 import json
 import logging
+from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict
 
 from aiogram import BaseMiddleware, Router, Bot
@@ -12,6 +13,10 @@ from utils import order_manager, inventory_manager
 logger = logging.getLogger("admin_handlers")
 
 router = Router()
+
+# Telegram caps a single message at 4096 characters. We stay well under that
+# so formatting overhead (emoji, joins) never risks tripping the real limit.
+MAX_MESSAGE_CHARS = 3500
 
 
 def _is_admin(message: Message) -> bool:
@@ -57,21 +62,127 @@ class AdminOnlyMiddleware(BaseMiddleware):
 router.message.middleware(AdminOnlyMiddleware())
 
 
+def _format_created_at(created_at: str | None) -> str:
+    if not created_at:
+        return "unknown time"
+    try:
+        dt = datetime.fromisoformat(created_at)
+        return dt.strftime("%Y-%m-%d %H:%M UTC")
+    except ValueError:
+        return created_at
+
+
+def _format_payment_status(order: dict) -> str:
+    """
+    Human-readable payment state, distinguishing "no proof yet" from
+    "proof submitted, waiting on the seller" and surfacing what kind of
+    proof (screenshot vs typed reference) was submitted, since /confirm and
+    /reject decisions hinge on this.
+    """
+    status = order.get("status")
+    proof = order.get("payment_proof")
+
+    if status == "pending_confirmation":
+        return "⏳ Awaiting payment"
+    if status == "awaiting_review":
+        if isinstance(proof, str) and proof.startswith("photo:"):
+            return "📸 Payment screenshot submitted — awaiting review"
+        if proof:
+            return f'📎 Payment reference submitted ("{proof}") — awaiting review'
+        return "📎 Payment proof submitted — awaiting review"
+    return status or "unknown status"
+
+
+def _format_order_detail(order: dict) -> str:
+    """
+    Renders one order as a multi-line block: id/status, who placed it and
+    when, every line item (resolved to a product name/size/color/quantity
+    rather than a bare count), and an estimated total from current
+    inventory prices. Previously /pending_orders only showed an item
+    *count*, forcing the seller to open orders.json by hand to see what was
+    actually ordered — see Issue #5.
+    """
+    lines = [
+        f"🧾 {order.get('order_id')} — {_format_payment_status(order)}",
+        f"From: @{order.get('username') or 'unknown'} (user_id: {order.get('user_id')})",
+        f"Placed: {_format_created_at(order.get('created_at'))}",
+        "Items:",
+    ]
+
+    items = order.get("items", [])
+    total = 0.0
+    total_known = bool(items)
+
+    for item in items:
+        product = inventory_manager.get_product_by_id(item.get("product_id", ""))
+        qty = item.get("quantity", 0)
+        size = item.get("size")
+        color = item.get("color")
+
+        if not product:
+            # Product may have been deleted/renamed since the order was
+            # placed (same edge case restore_stock_for_order already
+            # handles) — fall back to the raw id instead of failing.
+            total_known = False
+            lines.append(f"  • {item.get('product_id')} (no longer in inventory) — {size}/{color} × {qty}")
+            continue
+
+        name = product.get("name", item.get("product_id"))
+        price = product.get("price")
+        if isinstance(price, (int, float)):
+            subtotal = price * qty
+            total += subtotal
+            lines.append(
+                f"  • {name} — {size}/{color} × {qty} (≈{price:,.0f} each, ≈{subtotal:,.0f} subtotal)"
+            )
+        else:
+            total_known = False
+            lines.append(f"  • {name} — {size}/{color} × {qty}")
+
+    if total_known:
+        lines.append(f"Est. total (current prices): ≈{total:,.0f}")
+
+    return "\n".join(lines)
+
+
+def _chunk_order_blocks(blocks: list[str]) -> list[str]:
+    """
+    Groups formatted order blocks into messages that stay under Telegram's
+    character limit, instead of one giant message that could get rejected
+    or truncated once there are enough pending orders.
+    """
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+
+    for block in blocks:
+        block_len = len(block) + 2  # + the "\n\n" separator between blocks
+        if current and current_len + block_len > MAX_MESSAGE_CHARS:
+            chunks.append("\n\n".join(current))
+            current = []
+            current_len = 0
+        current.append(block)
+        current_len += block_len
+
+    if current:
+        chunks.append("\n\n".join(current))
+
+    return chunks
+
+
 @router.message(Command("pending_orders"))
 async def pending_orders(message: Message):
     # Use the new safe, locked read function instead of direct file access
     orders = await order_manager.get_all_orders()
-    
+
     pending = [o for o in orders if o["status"] in ("pending_confirmation", "awaiting_review")]
     if not pending:
         await message.answer("No pending orders.")
         return
-    
-    text = "\n\n".join(
-        f"{o['order_id']} — @{o['username']} — {len(o['items'])} item(s) — {o['status']}" 
-        for o in pending
-    )
-    await message.answer(text)
+
+    blocks = [_format_order_detail(o) for o in pending]
+    for chunk in _chunk_order_blocks(blocks):
+        await message.answer(chunk)
 
 
 @router.message(Command("confirm"))
