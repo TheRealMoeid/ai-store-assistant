@@ -1,0 +1,31 @@
+diff --git a/agent/agent.py b/agent/agent.py
+index 69b80ab..4343ef0 100644
+--- a/agent/agent.py
++++ b/agent/agent.py
+@@ -112,6 +112,8 @@ async def run_agent(user_id: int, username: str, user_message: str) -> tuple[str
+                     events.append({"type": "order", "data": result["order"]})
+                 if name == "log_feedback" and result.get("status") == "logged":
+                     events.append({"type": "feedback", "data": result["feedback"]})
++                if name == "submit_payment_reference" and result.get("status") == "proof_submitted":
++                    events.append({"type": "payment_reference", "data": result["order"]})
+ 
+                 messages.append({
+                     "role": "assistant",
+@@ -169,6 +171,8 @@ async def run_agent(user_id: int, username: str, user_message: str) -> tuple[str
+                     events.append({"type": "order", "data": result["order"]})
+                 if name == "log_feedback" and result.get("status") == "logged":
+                     events.append({"type": "feedback", "data": result["feedback"]})
++                if name == "submit_payment_reference" and result.get("status") == "proof_submitted":
++                    events.append({"type": "payment_reference", "data": result["order"]})
+ 
+                 messages.append({
+                     "role": "assistant",
+@@ -254,6 +258,8 @@ async def run_agent(user_id: int, username: str, user_message: str) -> tuple[str
+                 events.append({"type": "order", "data": result["order"]})
+             if name == "log_feedback" and result.get("status") == "logged":
+                 events.append({"type": "feedback", "data": result["feedback"]})
++            if name == "submit_payment_reference" and result.get("status") == "proof_submitted":
++                events.append({"type": "payment_reference", "data": result["order"]})
+ 
+             messages.append(
+                 {
