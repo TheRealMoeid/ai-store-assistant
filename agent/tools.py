@@ -289,15 +289,19 @@ async def _place_order(args: dict, ctx: dict) -> dict:
             "shortfalls": shortfalls,
         }
 
-    for item in cart:
-        # Atomically validate and decrement stock for the entire cart at once.
-        result = await inventory_manager.decrement_stock_for_cart(cart)
-        if result.get("error"):
-            return {
-                "error": "could not reserve stock while placing order",
-                "hint": f"Stock changed unexpectedly. {result.get('hint', 'Please try adjusting your cart.')}",
-                "detail": result,
-            }
+    # Atomically validate and decrement stock for the entire cart at once.
+    # decrement_stock_for_cart already iterates every line item internally,
+    # so it must be called exactly once per checkout — previously this was
+    # wrapped in `for item in cart:`, which re-ran the full-cart decrement
+    # once per line item (N times for an N-item cart), over-decrementing
+    # stock by a multiple of what was actually ordered. See Issue #6.
+    result = await inventory_manager.decrement_stock_for_cart(cart)
+    if result.get("error"):
+        return {
+            "error": "could not reserve stock while placing order",
+            "hint": f"Stock changed unexpectedly. {result.get('hint', 'Please try adjusting your cart.')}",
+            "detail": result,
+        }
 
     order = await order_manager.place_order(ctx["user_id"], ctx["username"], cart)
     
