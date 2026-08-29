@@ -41,7 +41,7 @@
           "size": "45",
           "color": "cool grey",
           "material": "leather/suede",
-          "stock": 99
+          "stock": 98
         }
       ]
     },
@@ -62,7 +62,7 @@
           "size": "L",
           "color": "black",
           "material": "cotton fleece",
-          "stock": 6
+          "stock": 5
         },
         {
           "size": "M",
