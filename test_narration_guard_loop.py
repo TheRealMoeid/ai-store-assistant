@@ -218,7 +218,7 @@ async def test_narrated_reply_is_not_persisted_to_conversation_history(monkeypat
 
     assert reply == "Sure — what size and color?"
 
-    history = conversation_manager.load_history(3)
+    history = await conversation_manager.load_history(3)
     assistant_messages = [m["content"] for m in history if m.get("role") == "assistant"]
 
     assert "I've added that to your cart!" not in assistant_messages

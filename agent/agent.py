@@ -81,8 +81,8 @@ async def run_agent(user_id: int, username: str, user_message: str) -> tuple[str
     """
     client, model = get_client()
 
-    conversation_manager.append_messages(user_id, [{"role": "user", "content": user_message}])
-    history = conversation_manager.get_recent_for_llm(user_id)
+    await conversation_manager.append_messages(user_id, [{"role": "user", "content": user_message}])
+    history = await conversation_manager.get_recent_for_llm(user_id)
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history]
     events: list[dict] = []
@@ -142,7 +142,7 @@ async def run_agent(user_id: int, username: str, user_message: str) -> tuple[str
                 fallback = "Sorry, I got a bit confused there — could you rephrase that?"
                 turn_messages = messages[len(history) + 1:]
                 turn_messages.append({"role": "assistant", "content": fallback})
-                conversation_manager.append_messages(user_id, turn_messages)
+                await conversation_manager.append_messages(user_id, turn_messages)
                 return fallback, events
 
             messages.append({
@@ -234,7 +234,7 @@ async def run_agent(user_id: int, username: str, user_message: str) -> tuple[str
                 continue
 
             logger.info("NO TOOL CALL — model answered directly: %r", reply)
-            conversation_manager.append_messages(user_id, [{"role": "assistant", "content": reply}])
+            await conversation_manager.append_messages(user_id, [{"role": "assistant", "content": reply}])
             return reply, events
 
         # Successful structured tool call — reset the malformed-retry counter.
@@ -273,5 +273,5 @@ async def run_agent(user_id: int, username: str, user_message: str) -> tuple[str
     fallback = "Sorry, I'm having trouble finishing that request — could you try rephrasing?"
     turn_messages = messages[len(history) + 1:]
     turn_messages.append({"role": "assistant", "content": fallback})
-    conversation_manager.append_messages(user_id, turn_messages)
+    await conversation_manager.append_messages(user_id, turn_messages)
     return fallback, events
