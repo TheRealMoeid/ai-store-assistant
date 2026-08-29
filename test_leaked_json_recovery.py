@@ -209,7 +209,7 @@ async def test_leaked_json_messages_include_recovered_tool_call_and_result(monke
 
     await run_agent(user_id=4, username="dave", user_message="add sneakers")
 
-    history = conversation_manager.load_history(4)
+    history = await conversation_manager.load_history(4)
     roles = [m.get("role") for m in history]
     assert "assistant" in roles
     # the final assistant reply is always saved; a tool-call turn must have

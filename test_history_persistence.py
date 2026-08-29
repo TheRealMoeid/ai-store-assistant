@@ -31,11 +31,11 @@ async def main():
         {"role": "assistant", "content": "Reply 3"},
     ]
     
-    conversation_manager.append_messages(user_id, messages)
+    await conversation_manager.append_messages(user_id, messages)
     print("1. Saved 8 messages to history.")
     
     # Now get recent for LLM (limit is 5)
-    recent = conversation_manager.get_recent_for_llm(user_id)
+    recent = await conversation_manager.get_recent_for_llm(user_id)
     
     print(f"2. Retrieved {len(recent)} messages for LLM.")
     print("3. Messages retrieved:")
