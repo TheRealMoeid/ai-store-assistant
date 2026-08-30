@@ -1,40 +1,35 @@
-# AI Store Assistant
-
-An `aiogram` 3 Telegram bot powered by an LLM tool-calling agent. Customers chat naturally to search inventory, check stock, manage a cart, place orders, and submit payment proof. The seller manages inventory by directly editing a JSON file and confirms or rejects orders via Telegram commands in an admin group. 
-
-By design, this is a lightweight, small-scale project that uses plain JSON files for persistence, eliminating the need for a traditional database and keeping the inventory fully editable by the seller.
-
----
+# Shopmate an AI Sales Agent for Telegram
 
 ## 1. Project Overview
 
-The AI Store Assistant solves the problem of managing a small Telegram-based store without complex backend infrastructure or manual order-taking. Instead of navigating rigid menus, customers interact with a conversational AI agent that understands natural language, queries the store's inventory, and guides the user through a complete checkout flow. The main goal is to provide a reliable, self-hosted, and easily configurable sales agent that requires minimal maintenance.
+**Shopmate** (AI Store Assistant) is a lightweight, conversational AI sales agent for Telegram, powered by an LLM tool-calling loop. It allows customers to browse inventory, check stock, manage a shopping cart, place orders, and submit payment proof using natural language. 
+
+Designed specifically for small-scale, single-seller operations, the project intentionally avoids traditional databases. Instead, it uses flat JSON files for persistence, allowing the seller to manually edit `data/inventory.json` directly without needing an admin panel. Orders are confirmed or rejected by the seller via Telegram commands in a dedicated admin group.
 
 ---
 
-## 2. Features
+## 2. Key Features
 
-The following features are fully implemented and operational:
-
-- **Natural Language Search**: Customers can browse or search for products by name or category.
-- **Real-Time Availability Checking**: Validates stock levels for specific variants (e.g., size, color) before allowing cart additions.
-- **Persistent Shopping Cart**: Carts are saved to disk, surviving bot restarts without losing customer state.
-- **Order Placement & Payment Proof**: Customers can finalize orders and submit transaction references or payment screenshots.
-- **Admin Management**: Sellers receive notifications in a designated Telegram group and can manage orders using `/pending_orders`, `/confirm <id>`, and `/reject <id>`.
-- **Live Inventory Reloading**: The bot automatically detects and applies changes to `data/inventory.json` without requiring a restart.
-- **Robust Error Recovery**: Built-in guards prevent LLM hallucinations, recover from malformed tool calls, and safely manage conversation history.
-- **Swappable LLM Backend**: Seamlessly switch between local development (Ollama) and production (Groq) via environment variables.
+- **Natural Language Shopping**: Customers chat naturally to search products, check variant availability (size/color), and build a cart.
+- **Persistent State**: Shopping carts and conversation histories are saved to disk, surviving bot restarts without losing customer context.
+- **Robust Admin Workflow**: Sellers receive detailed order notifications and manage fulfillment using `/pending_orders`, `/confirm <id>`, and `/reject <id>`.
+- **Automated Stock Management**: 
+  - Stock is validated and decremented atomically at checkout.
+  - Rejected orders automatically and safely restore reserved inventory.
+- **Payment Proof Handling**: Customers can submit payment screenshots (processed directly) or type transaction references (processed via the LLM), both of which notify the admin group for review.
+- **Swappable LLM Backend**: Seamlessly switch between local development (Ollama) and cloud production (Groq) via environment variables.
+- **Self-Correcting AI Agent**: Built-in structural guards intercept LLM hallucinations, recover from malformed tool calls, and force the model to retry if it "narrates" an action without actually executing it.
 
 ---
 
-## 3. Architecture
+## 3. System Architecture
 
-The system follows a modular, event-driven architecture centered around the LLM tool-calling loop.
+The system follows a modular, event-driven architecture centered around a highly defensive LLM tool-calling loop.
 
 ```text
-Telegram User / Admin
+Telegram User / Admin Group
         ↓
-aiogram Dispatcher (bot.py)
+aiogram 3 Dispatcher (bot.py)
         ↓
 Handlers (user_handlers.py / admin_handlers.py)
         ↓
@@ -42,10 +37,17 @@ AI Agent Loop (agent/agent.py)
         ↓
 Tool Execution (agent/tools.py)
         ↓
-Business Logic & Persistence (utils/*.py)
+Business Logic & Persistence (utils/*.py) ←→ asyncio.Lock
         ↓
 JSON Data Store (data/*.json)
 ```
+
+1. **User Interaction**: A user sends a message. `user_handlers.py` intercepts it and passes the text to `run_agent`.
+2. **Context Building**: `conversation_manager` loads the user's recent history (safely trimmed to avoid orphaned tool calls) and appends the new message.
+3. **LLM Decision**: The agent sends the context and tool schemas to the configured LLM.
+4. **Tool Execution**: If the LLM requests a tool, `agent.py` executes it via `call_tool`. The tool interacts with the `utils` layer (e.g., checking `inventory_manager`), returns a structured result, and the loop repeats.
+5. **Final Response**: Once the LLM returns a text response without tool calls, it is sent back to the user, and the turn is saved to disk.
+6. **Admin Flow**: When an order is placed or payment proof is submitted, the admin group receives a notification. The seller uses `/confirm` or `/reject` to update the order status, which automatically DMs the customer and adjusts inventory.
 
 ---
 
@@ -54,25 +56,24 @@ JSON Data Store (data/*.json)
 ```text
 ai-store-assistant/
 ├── agent/                      # AI agent core logic
-│   ├── agent.py                # Tool-calling loop and recovery guards
+│   ├── agent.py                # Tool-calling loop, recovery guards, narration guard
 │   ├── llm_client.py           # Swappable LLM provider (Ollama/Groq)
 │   ├── prompts.py              # System prompt rules and constraints
 │   └── tools.py                # Tool schemas (OpenAI format) and implementations
 ├── handlers/                   # Telegram message routing
-│   ├── admin_handlers.py       # Admin commands (/pending_orders, etc.)
+│   ├── admin_handlers.py       # Admin commands (/pending_orders, /confirm, /reject)
 │   └── user_handlers.py        # User message routing and payment screenshot handling
 ├── utils/                      # Business logic and data management
-│   ├── cart_manager.py         # Persistent cart storage
-│   ├── conversation_manager.py # History load, save, and safe-trimming
-│   ├── inventory_manager.py    # Live-reloading inventory reads
+│   ├── cart_manager.py         # Persistent cart storage with async locks
+│   ├── conversation_manager.py # History load, save, safe-trimming, and async locks
+│   ├── inventory_manager.py    # Live-reloading inventory reads and atomic stock writes
 │   └── order_manager.py        # Order and feedback persistence with async locks
-├── data/                       # JSON data storage (gitignored in production)
+├── data/                       # JSON data storage
 │   ├── inventory.json          # Seller-edited product catalog
 │   ├── orders.json             # Append-only order log
 │   ├── carts.json              # Persistent user carts
 │   ├── feedback.json           # Customer compliments/complaints log
-│   └── conversations/          # Per-user chat history (JSON)
-├── tests/                      # Test suite directory
+│── test/                       # Pytest test suite
 ├── bot.py                      # Application entrypoint
 ├── config.py                   # Settings loaded from .env
 ├── requirements.txt            # Python dependencies
@@ -81,66 +82,61 @@ ai-store-assistant/
 
 ---
 
-## 5. How It Works
+## 5. Technologies and Dependencies
 
-1. **Startup**: `bot.py` initializes the `aiogram` Dispatcher, loads configuration from `.env`, and registers the admin and user routers.
-2. **User Interaction**: A user sends a message. `user_handlers.py` intercepts it and passes the text to `run_agent` in `agent.py`.
-3. **Context Building**: `conversation_manager.py` loads the user's recent history, safely trimmed to avoid orphaned tool calls, and appends the new message.
-4. **LLM Decision**: The agent sends the context and `TOOL_SCHEMAS` to the configured LLM. 
-5. **Tool Execution**: If the LLM requests a tool, `agent.py` executes it via `call_tool` in `tools.py`. The tool interacts with the `utils` layer (e.g., checking `inventory_manager`), returns a structured result, and the loop repeats.
-6. **Final Response**: Once the LLM returns a text response without tool calls, it is sent back to the user, and the turn is saved to disk.
-7. **Admin Flow**: When an order is placed, the admin group receives a notification. The seller uses `/confirm` or `/reject` to update the order status, which automatically DMs the customer.
-
----
-
-## 6. Technologies Used
-
-- **Python 3.11 / 3.12**: Required runtime. (Avoid Python 3.14+ due to missing `pydantic-core` prebuilt wheels).
+- **Python 3.11 / 3.12**: Required runtime. *(Note: Python 3.14+ is currently unsupported due to missing prebuilt wheels for `pydantic-core`, an `aiogram`/`openai` dependency).*
 - **aiogram (3.x)**: Asynchronous Telegram Bot API framework for routing and message handling.
 - **openai (Python SDK)**: Used to interact with both Groq and Ollama, as both expose OpenAI-compatible API endpoints.
 - **python-dotenv**: Loads environment variables from `.env` securely.
+- **pytest / pytest-asyncio**: For running the automated test suite.
 - **JSON**: File-based persistence for all state, chosen for simplicity and direct seller editability.
 
 ---
 
-## 7. Installation
+## 6. Setup and Installation
 
 ### Prerequisites
-- Python 3.11 or 3.12
-- `pip` and `venv`
+- Python 3.11 or 3.12 installed.
 - For local development: [Ollama](https://ollama.com/) installed and running.
 
-### Setup Steps
-1. Clone the repository:
+### Steps
+
+1. **Clone the repository:**
    ```bash
    git clone https://github.com/TheRealMoeid/ai-store-assistant.git
    cd ai-store-assistant
    ```
-2. Create and activate a virtual environment:
+
+2. **Create and activate a virtual environment:**
    ```bash
    python -m venv venv
    source venv/bin/activate  # On Windows: venv\Scripts\activate
    ```
-3. Install dependencies:
+
+3. **Install dependencies:**
    ```bash
    pip install -r requirements.txt
    ```
-4. Configure environment variables:
+
+4. **Configure environment variables:**
    ```bash
    cp .env.example .env
    ```
-   Edit `.env` with your specific values (see Configuration section).
+   Edit `.env` with your specific values (see Configuration section below).
 
 ---
 
-## 8. Configuration
+## 7. Configuration
 
-Edit the `.env` file. Never commit actual secrets to version control.
+Edit the `.env` file. Never commit actual secrets or real user IDs to version control.
 
 ```env
 # --- Telegram ---
 BOT_TOKEN=your_telegram_bot_token_here
-ADMIN_GROUP_ID=-1001234567890   # Must be a negative number; the chat_id of your admin group
+ADMIN_GROUP_ID=-1001234567890   # Must be a negative number (the chat_id of your admin group)
+
+# Optional: comma-separated user_ids allowed to run admin commands from a private DM
+ADMIN_USER_IDS=
 
 # --- LLM Provider: "ollama" or "groq" ---
 LLM_PROVIDER=ollama
@@ -157,11 +153,11 @@ GROQ_MODEL=llama-3.3-70b-versatile
 MAX_HISTORY_MESSAGES=20         # Number of recent messages sent to the LLM to bound context size
 ```
 
-*Note on `ADMIN_GROUP_ID`*: Add the bot to your Telegram group, send any message, and visit `https://api.telegram.org/bot<BOT_TOKEN>/getUpdates`. The group's `chat.id` (a negative integer) is your `ADMIN_GROUP_ID`.
+*Note on `ADMIN_GROUP_ID`*: Add the bot to your Telegram group, send any message, and visit `https://api.telegram.org/bot<BOT_TOKEN>/getUpdates` (ensure the bot script is **not** running while you check this). The group's `chat.id` (a negative integer) is your `ADMIN_GROUP_ID`.*
 
 ---
 
-## 9. Running the Project
+## 8. Running the Project
 
 Ensure your virtual environment is activated and your `.env` is configured.
 
@@ -182,67 +178,82 @@ Ensure your virtual environment is activated and your `.env` is configured.
 
 ---
 
-## 10. Testing
+## 9. Running Tests
 
-The project includes a suite of targeted tests to verify critical architectural guarantees, located in the root directory (e.g., `test_concurrency.py`, `test_cart_persistence.py`, `test_narration_guard.py`).
+The project includes a comprehensive suite of targeted tests to verify critical architectural guarantees, concurrency safety, and agent guardrails. Tests are located in the `test/` directory and root directory.
 
-To run the tests:
+To run the full test suite:
 ```bash
-pytest test_*.py -v
+pytest . -v
 ```
+*(Note: On Windows PowerShell, use `pytest . -v` instead of glob patterns like `pytest test_*.py` to ensure proper test discovery.)*
 
-**Test Coverage**:
-- **Concurrency**: Verifies that `asyncio.Lock` prevents race conditions during simultaneous order placements.
-- **Persistence**: Confirms that carts and conversation history survive bot restarts.
-- **Agent Guards**: Validates that the narration guard intercepts hallucinated actions and that malformed JSON tool calls are safely recovered using `json.JSONDecoder.raw_decode()`.
+**Test Coverage Highlights:**
+- **Concurrency & Atomicity**: Verifies that `asyncio.Lock` prevents race conditions during simultaneous order placements (`test_concurrency.py`) and multi-item stock decrements (`test_multi_item_checkout.py`).
+- **Persistence**: Confirms carts and conversation history survive restarts and lock correctly under concurrent load.
+- **Agent Guards**: Validates that the narration guard intercepts hallucinated actions, malformed JSON tool calls are safely recovered, and payment reference events correctly trigger admin notifications.
+- **Stock Reversal**: Ensures rejected orders correctly restore inventory atomically.
 
-*Limitation*: Tests currently focus on unit-level logic and agent guards. End-to-end Telegram integration testing is not yet automated.
+*Warning: Some standalone root-level scripts (e.g., `test_concurrency.py`) write directly to real `data/` JSON files when run outside the sandboxed `pytest` suite. Always check `git status` before committing to avoid accidentally committing synthetic test data.*
 
 ---
 
-## 11. AI Agent Architecture
+## 10. AI Agent & Reliability Engineering
 
-The AI agent is designed for maximum reliability with smaller, local models, incorporating several defensive patterns:
+The AI agent is engineered for maximum reliability with smaller, local models, incorporating several defensive patterns:
 
-- **Tool-Calling Loop**: Managed in `agent/agent.py`. It iterates up to `MAX_TOOL_ROUNDS`, sending context and tool schemas to the LLM, executing requested tools, and feeding results back until a final text response is generated.
-- **Context Management**: `conversation_manager.py` persists the full conversation to disk but intelligently trims the payload sent to the LLM. It ensures trimming never splits a `tool_call` and its corresponding `tool` result, preventing orphaned `tool_call_id` API errors.
+- **Tool-Calling Loop**: Managed in `agent/agent.py`, it iterates up to `MAX_TOOL_ROUNDS`, sending context and tool schemas to the LLM, executing requested tools, and feeding results back until a final text response is generated.
 - **Malformed Call Recovery**: 
   - *Leaked JSON*: If the model outputs tool call JSON as plain text, `_parse_leaked_json_tool_call` structurally parses and executes it.
   - *Native Tags*: If the model outputs proprietary tags (e.g., `<function=...>`), `_parse_native_function_call` uses `json.JSONDecoder.raw_decode()` to safely extract nested arguments without fragile regex matching.
-- **Narration Guard**: A structural guard scans the model's text output for commitment phrases (e.g., "I added that to your cart"). If detected without a corresponding tool call, the agent injects a corrective system message forcing the model to retry with the actual tool.
-- **Secure Context Injection**: `user_id` and `username` are injected into the tool execution context by the dispatcher, never parsed from the LLM's arguments, preventing spoofing.
+- **Narration Guard**: A structural guard scans the model's text output for commitment phrases (e.g., "I added that to your cart"). If detected without a corresponding tool call, the agent injects a corrective system message and loops back (`continue`), forcing the model to retry with the actual tool instead of returning a false confirmation to the user.
+- **Concurrency Safety**: All persistence managers (`cart`, `order`, `inventory`, `conversation`) use `asyncio.Lock` to prevent race conditions during read-modify-write cycles.
+- **Secure Context Injection**: `user_id` and `username` are injected into the tool execution context by the Telegram dispatcher, never parsed from the LLM's arguments, preventing spoofing.
+- **Safe History Trimming**: `conversation_manager.py` persists the full conversation to disk but intelligently trims the payload sent to the LLM. It ensures trimming never splits a `tool_call` and its corresponding `tool` result, preventing orphaned API errors.
 
 ---
 
-## 12. Current Project Status
+## 11. Current Status and Known Limitations
 
-The core architecture is stable and hardened. Recent updates (August 2026) successfully resolved critical P0/P1 bugs identified in early audits:
-- ✅ Concurrent read-modify-write race conditions in orders/feedback are now prevented via `asyncio.Lock`.
-- ✅ Ephemeral in-memory carts have been replaced with persistent disk storage (`data/carts.json`).
-- ✅ History trimming is now "safe," preventing API crashes from orphaned tool calls.
-- ✅ Malformed tool call recovery uses robust JSON decoding instead of fragile regex.
+The core architecture is stable and heavily hardened against common LLM failure modes. 
 
-**Known Limitations (By Design or Backlog)**:
-- No real payment gateway integration (relies on manual screenshot/reference review).
-- Product search is keyword/category-based; fuzzy matching is not yet implemented.
-- Order status is limited to `pending_confirmation`, `awaiting_review`, `confirmed`, and `rejected` (no "shipped" or "delivered" states yet).
+### Fully Implemented & Hardened
+- ✅ Concurrent read-modify-write race conditions prevented via `asyncio.Lock` across all managers.
+- ✅ Ephemeral in-memory carts replaced with persistent disk storage.
+- ✅ Malformed tool call recovery uses robust JSON decoding.
+- ✅ Narration guard correctly forces self-correction loops.
+- ✅ Admin authorization gates all sensitive commands.
+- ✅ Stock reversal on order rejection.
+- ✅ Atomic multi-item stock decrement at checkout.
+- ✅ Admin notifications for typed payment references.
+
+### By Design
+- **No Database**: Flat JSON files are used intentionally so the seller can edit `inventory.json` directly via text editor.
+- **No Payment Gateway**: Relies on manual screenshot/reference review by the seller.
+- **Keyword Search**: Product search is substring/keyword-based; fuzzy matching and product images are not yet implemented.
+- **Basic Order Status**: Limited to `pending_confirmation`, `awaiting_review`, `confirmed`, and `rejected`.
+
+### Backlog / Known Limitations
+- **Atomic Cart-Consumption**: The full `_place_order` sequence (read cart → validate → decrement stock → create order → clear cart) is not wrapped in a single overarching lock, meaning near-simultaneous checkout requests from the *same* user could theoretically race.
+- **Substring Color Matching**: Color matching uses `in` rather than exact `==`, which could cause inventory drift on rejection if overlapping color names exist (e.g., "Red" vs "Red/Blue").
+- **Hardcoded Recovery IDs**: Synthetic `tool_call_id`s used in malformed-call recovery are static strings; multiple recovery events in one conversation could theoretically collide.
+- **Sync File I/O**: JSON reads/writes use synchronous `open()` inside `async` functions, which blocks the event loop (acceptable at current single-seller scale).
+- **Payment Proof Resubmission**: Customers cannot easily overwrite a wrong payment screenshot once an order moves to `awaiting_review`.
 
 ---
 
-## 13. Development
+## 12. Development Conventions
 
-If you wish to extend or modify the project, follow these guidelines:
+If you wish to extend or modify the project, follow these established guidelines:
 
-- **Adding New Tools**: Define the OpenAI-compatible schema in `agent/tools.py` under `TOOL_SCHEMAS`, and implement the logic in the `_DISPATCH` dictionary. Ensure the implementation handles missing arguments gracefully.
-- **Modifying Agent Behavior**: Always update `agent/prompts.py` first if the LLM exhibits a new failure mode (e.g., hallucinating shipping times). Prompt-level fixes are faster and cheaper than code-level workarounds. Modify the loop logic in `agent/agent.py` only if structural changes are required.
-- **Business Logic**: Keep all data manipulation (reading/writing JSON, validating stock) inside the `utils/` directory. 
-- **Testing**: Add new test files prefixed with `test_` in the root directory to cover new tools or guards. Run `pytest` before committing.
-- **Architectural Convention**: Never trust the LLM to provide the `user_id`. Always rely on the context injected by the Telegram handler.
+1. **Prompt-Level Fixes First**: If the LLM exhibits a new failure mode (e.g., hallucinating shipping times), update `agent/prompts.py` first. Prompt-level fixes are faster and cheaper than code-level workarounds.
+2. **Whole-File Replacement**: When making multi-line changes, prefer regenerating and handing over the full file content over patch/diff files, which frequently fail to apply cleanly against working trees with local drift.
+3. **Never Trust the LLM for Context**: Never parse `user_id` or `username` from model tool-call arguments. Always rely on the context injected by the Telegram handler.
+4. **Minimal, Structurally-Scoped Fixes**: Prefer small fixes that don't touch already-working, already-tested code paths unless deduplication is strictly required to solve the issue at hand.
+5. **Separate Unrelated Changes**: Never bundle unrelated local edits (e.g., stray type-checker suppressions) into a feature branch commit.
 
 ---
 
-## 14. License
+## 13. License
 
-This project is licensed under the [MIT License](LICENSE).
-
-See the [LICENSE](LICENSE) file for the full license text.
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
