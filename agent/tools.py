@@ -10,7 +10,38 @@ injected by dispatch() from the real Telegram context, so the model can't
 spoof who's ordering.
 """
 import json
+import asyncio
 from utils import inventory_manager, order_manager, cart_manager
+
+# Serializes the entire read -> validate -> decrement -> create-order -> clear
+# sequence in _place_order across ALL users. Without this, two near-simultaneous
+# checkout requests for the same user (double-tap, client retry, etc.) can both
+# read the same cart before either clears it, both pass validation, and each
+# independently decrement stock and create its own order — a duplicate order
+# for what the customer intended as a single checkout. See Issue #10 / bug-audit
+# 3.1.
+#
+# A single global lock (not per-user) is used deliberately, matching the
+# precedent set for utils/conversation_manager.py's _history_lock (Issue 3.3):
+# this project's own "minimal, structurally-scoped fixes" principle favors a
+# proven single-lock-per-concern pattern over new architectural surface like a
+# per-user dict of locks, especially since checkouts are rare, high-value
+# events for a small-scale, single-seller bot — the cross-user contention from
+# serializing all checkouts globally is negligible in practice, and it avoids
+# introducing any lock-ordering coupling between cart_manager, inventory_manager,
+# and order_manager (the lock lives here in the orchestration layer, not inside
+# any of those modules, so their own internal locks are still acquired and
+# released independently and sequentially, exactly as before).
+#
+# Deliberately does NOT clear the cart until every step has succeeded (unlike
+# an "atomically consume the cart up front, then restore it if something later
+# fails" design) — clearing early would open a window where a concurrent
+# add_to_cart could write a new item into the (already-cleared) cart, only for
+# a subsequent failure-path restore to silently overwrite and lose it. Holding
+# this lock for the whole sequence and only clearing the cart as the last step
+# avoids that data-loss class entirely, at the cost of no other compensating
+# logic being needed.
+_checkout_lock = asyncio.Lock()
 
 TOOL_SCHEMAS = [
     {
@@ -254,61 +285,71 @@ async def _view_cart(args: dict, ctx: dict) -> dict:
     return {"cart": cart}
 
 async def _place_order(args: dict, ctx: dict) -> dict:
-    # Load the cart from disk
-    cart = await cart_manager.get_cart(ctx["user_id"])
-    if not cart:
-        return {
-            "error": "cart is empty",
-            "hint": "You haven't actually called add_to_cart yet — do that first with the item(s) the customer wants, then call place_order again.",
-        }
+    # Serializes the whole checkout sequence (read cart -> validate -> decrement
+    # stock -> create order -> clear cart) across all users. See the
+    # _checkout_lock docstring above for why this is a single global lock held
+    # for the full duration rather than an "atomically consume the cart, restore
+    # on failure" design. Fixes Issue #10 / bug-audit 3.1 (duplicate orders from
+    # near-simultaneous checkout requests for the same user).
+    async with _checkout_lock:
+        # Load the cart from disk
+        cart = await cart_manager.get_cart(ctx["user_id"])
+        if not cart:
+            return {
+                "error": "cart is empty",
+                "hint": "You haven't actually called add_to_cart yet — do that first with the item(s) the customer wants, then call place_order again.",
+            }
 
-    # Re-validate every line against *current* stock before touching anything.
-    shortfalls = []
-    for item in cart:
-        variants = inventory_manager.check_variant(item["product_id"], item["size"], item["color"])
-        available = sum(v["stock"] for v in variants)
-        if available < item["quantity"]:
-            shortfalls.append(
-                {
-                    "product_id": item["product_id"],
-                    "size": item["size"],
-                    "color": item["color"],
-                    "requested": item["quantity"],
-                    "available": available,
-                }
-            )
+        # Re-validate every line against *current* stock before touching anything.
+        shortfalls = []
+        for item in cart:
+            variants = inventory_manager.check_variant(item["product_id"], item["size"], item["color"])
+            available = sum(v["stock"] for v in variants)
+            if available < item["quantity"]:
+                shortfalls.append(
+                    {
+                        "product_id": item["product_id"],
+                        "size": item["size"],
+                        "color": item["color"],
+                        "requested": item["quantity"],
+                        "available": available,
+                    }
+                )
 
-    if shortfalls:
-        return {
-            "error": "stock changed since items were added to cart",
-            "hint": (
-                "One or more cart items no longer have enough stock. Tell the customer "
-                "exactly which item(s) and how many are actually available now, and ask "
-                "them how they'd like to adjust their cart. Do not place the order."
-            ),
-            "shortfalls": shortfalls,
-        }
+        if shortfalls:
+            return {
+                "error": "stock changed since items were added to cart",
+                "hint": (
+                    "One or more cart items no longer have enough stock. Tell the customer "
+                    "exactly which item(s) and how many are actually available now, and ask "
+                    "them how they'd like to adjust their cart. Do not place the order."
+                ),
+                "shortfalls": shortfalls,
+            }
 
-    # Atomically validate and decrement stock for the entire cart at once.
-    # decrement_stock_for_cart already iterates every line item internally,
-    # so it must be called exactly once per checkout — previously this was
-    # wrapped in `for item in cart:`, which re-ran the full-cart decrement
-    # once per line item (N times for an N-item cart), over-decrementing
-    # stock by a multiple of what was actually ordered. See Issue #6.
-    result = await inventory_manager.decrement_stock_for_cart(cart)
-    if result.get("error"):
-        return {
-            "error": "could not reserve stock while placing order",
-            "hint": f"Stock changed unexpectedly. {result.get('hint', 'Please try adjusting your cart.')}",
-            "detail": result,
-        }
+        # Atomically validate and decrement stock for the entire cart at once.
+        # decrement_stock_for_cart already iterates every line item internally,
+        # so it must be called exactly once per checkout — previously this was
+        # wrapped in `for item in cart:`, which re-ran the full-cart decrement
+        # once per line item (N times for an N-item cart), over-decrementing
+        # stock by a multiple of what was actually ordered. See Issue #6.
+        result = await inventory_manager.decrement_stock_for_cart(cart)
+        if result.get("error"):
+            return {
+                "error": "could not reserve stock while placing order",
+                "hint": f"Stock changed unexpectedly. {result.get('hint', 'Please try adjusting your cart.')}",
+                "detail": result,
+            }
 
-    order = await order_manager.place_order(ctx["user_id"], ctx["username"], cart)
-    
-    # Clear the cart on disk since the order is placed
-    await cart_manager.set_cart(ctx["user_id"], [])
-    
-    return {"status": "order_placed", "order": order}
+        order = await order_manager.place_order(ctx["user_id"], ctx["username"], cart)
+
+        # Clear the cart on disk only now that everything else has actually
+        # succeeded — the cart is never mutated on a failure path, so there's
+        # nothing to restore and no window where a concurrent add_to_cart's
+        # write could be silently lost.
+        await cart_manager.set_cart(ctx["user_id"], [])
+
+        return {"status": "order_placed", "order": order}
 
 async def _submit_payment_reference(args: dict, ctx: dict) -> dict:
     order = order_manager.get_latest_unpaid_order(ctx["user_id"])
