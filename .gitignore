@@ -44,3 +44,5 @@ dist/
 *.egg-info/
 
 /data/conversations/
+
+.patch
