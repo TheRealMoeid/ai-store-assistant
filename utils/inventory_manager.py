@@ -55,7 +55,16 @@ def search_products(query: str = "", category: str = "") -> list[dict]:
     return results
 
 def check_variant(product_id: str, size: str = "", color: str = "") -> list[dict]:
-    """Returns matching variants (with stock count) for a product."""
+    """Returns matching variants (with stock count) for a product.
+
+    Color matching is exact (case-insensitive), not substring. Substring
+    matching (`"red" in "red/blue"`) let one customer-facing color like
+    "red" match multiple distinct variants at once, which caused stock to
+    be decremented across more than one variant for a single line item —
+    see decrement_stock_for_cart()/restore_stock_for_order() for the full
+    explanation of the resulting inventory drift on rejection (was a known
+    limitation, bug-audit issue 3.2).
+    """
     product = get_product_by_id(product_id)
     if not product:
         return []
@@ -64,7 +73,7 @@ def check_variant(product_id: str, size: str = "", color: str = "") -> list[dict
     for v in product.get("variants", []):
         if size and v.get("size", "").lower() != size.lower():
             continue
-        if color and color.lower() not in v.get("color", "").lower():
+        if color and color.lower() != v.get("color", "").lower():
             continue
         matches.append(v)
     return matches
@@ -88,7 +97,7 @@ async def decrement_stock_for_cart(cart_items: list[dict]) -> dict:
 
             matches = [
                 v for v in product.get("variants", [])
-                if v.get("size", "").lower() == item.get("size", "").lower() and item.get("color", "").lower() in v.get("color", "").lower()
+                if v.get("size", "").lower() == item.get("size", "").lower() and item.get("color", "").lower() == v.get("color", "").lower()
             ]
             if not matches:
                 return {"error": f"variant {item.get('size')}/{item.get('color')} not found for {item.get('product_id')}"}
@@ -106,7 +115,7 @@ async def decrement_stock_for_cart(cart_items: list[dict]) -> dict:
             product = next(p for p in data.get("products", []) if p.get("id") == item.get("product_id"))
             matches = [
                 v for v in product.get("variants", [])
-                if v.get("size", "").lower() == item.get("size", "").lower() and item.get("color", "").lower() in v.get("color", "").lower()
+                if v.get("size", "").lower() == item.get("size", "").lower() and item.get("color", "").lower() == v.get("color", "").lower()
             ]
 
             remaining = item.get("quantity", 0)
@@ -130,18 +139,21 @@ async def restore_stock_for_order(order_id: str) -> dict:
     """
     Gives back the stock reserved by decrement_stock_for_cart when an order
     is rejected. Re-runs the exact same size/color matching used to decrement,
-    so (in the normal case of one exact-matching variant per line item) stock
-    is credited back to precisely the variant it was taken from.
+    so stock is credited back to precisely the variant it was taken from.
 
-    Note: if a line item's size/color matched more than one variant at
-    decrement time (possible since color matching is substring-based), the
-    original decrement may have spread across multiple variants, but the
-    order record only stores product_id/size/color/quantity — not which
-    specific variant(s) absorbed it. In that rare case, this credits the
-    full quantity back to the first matching variant rather than trying to
-    reconstruct the original split. Flagging this as a known limitation
-    rather than solving it now, since real inventories in this project use
-    one variant per size/color combo.
+    Color matching is exact (case-insensitive) — see check_variant()'s
+    docstring. Previously it was substring-based, which meant a line item's
+    size/color could match more than one variant at decrement time (e.g.
+    color "red" matching both a "red" and a "red/blue" variant), spreading
+    the decrement across them — but the order record only ever stored
+    product_id/size/color/quantity, not which specific variant(s) absorbed
+    it, so this function had no way to know the original split and credited
+    the full quantity back to just the first match, silently drifting stock
+    on every such rejection (bug-audit issue 3.2, "Substring Color Matching
+    Causes Inventory Drift on Rejection"). With exact matching, a line item
+    can only ever match at most one variant, so decrement and restore are
+    now structurally guaranteed to agree — "credit the (only) match" is
+    correct by construction rather than a documented limitation.
 
     Returns a dict:
       {"status": "ok", "restored": [items], "skipped": [items]}
@@ -184,7 +196,7 @@ async def restore_stock_for_order(order_id: str) -> dict:
             matches = [
                 v for v in product.get("variants", [])
                 if v.get("size", "").lower() == item.get("size", "").lower()
-                and item.get("color", "").lower() in v.get("color", "").lower()
+                and item.get("color", "").lower() == v.get("color", "").lower()
             ]
             if not matches:
                 logger.warning(
