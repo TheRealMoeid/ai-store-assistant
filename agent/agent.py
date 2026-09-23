@@ -6,6 +6,7 @@ a final text answer.
 import json
 import logging
 import re
+import uuid
 from openai import BadRequestError
 from agent.llm_client import get_client
 from agent.tools import TOOL_SCHEMAS, call_tool
@@ -16,6 +17,39 @@ logger = logging.getLogger("agent")
 
 MAX_TOOL_ROUNDS = 9
 MAX_MALFORMED_RETRIES = 2
+
+
+def _new_recovery_tool_call_id(prefix: str) -> str:
+    """
+    Generates a unique synthetic tool_call_id for a recovered (malformed)
+    tool call, e.g. "recovered_3f9a1c2b8e4d4a1b9c0e1f2a3b4c5d6e".
+
+    Previously both recovery paths reused a single hardcoded literal
+    ("recovered_1" / "recovered_json_1") for every recovery event in the
+    process's lifetime. The OpenAI-compatible API expects every
+    tool_call_id within one conversation payload to be unique — it's how
+    an assistant turn's tool_calls entries are correlated with their
+    matching tool-role results. If recovery fired more than once for the
+    same user within the conversation-history trimming window
+    (MAX_HISTORY_MESSAGES), the persisted history could end up containing
+    two messages with the same tool_call_id, which could itself trigger a
+    BadRequestError on a later call — ironically the exact failure class
+    this recovery logic exists to work around. See bug-audit-evaluation.md
+    Issue 2.1.
+
+    Keeps the recognizable "recovered_"/"recovered_json_" prefix so
+    synthetic recovery IDs stay easy to spot in logs/persisted history
+    during debugging, per the fix's own agreed shape — just no longer a
+    static, reused string.
+
+    Note: this only prevents *future* collisions. It does not retroactively
+    rewrite already-persisted conversation JSON files that may still
+    contain duplicate static "recovered_1"/"recovered_json_1" IDs from
+    before this fix — acceptable at this project's scale (see CLAUDE.md's
+    "minimal, structurally-scoped fixes" convention), since old history
+    naturally ages out of the MAX_HISTORY_MESSAGES trim window over time.
+    """
+    return f"{prefix}_{uuid.uuid4().hex}"
 
 # Some smaller/local models occasionally "fake" a tool call by writing JSON
 # as plain reply text instead of using the real function-calling protocol,
@@ -115,18 +149,23 @@ async def run_agent(user_id: int, username: str, user_message: str) -> tuple[str
                 if name == "submit_payment_reference" and result.get("status") == "proof_submitted":
                     events.append({"type": "payment_reference", "data": result["order"]})
 
+                # Unique per recovery event — see _new_recovery_tool_call_id
+                # docstring (Issue 2.1). Generated once and reused for both
+                # the synthetic assistant tool_calls entry and the matching
+                # tool result below, since the two must correlate.
+                recovery_id = _new_recovery_tool_call_id("recovered")
                 messages.append({
                     "role": "assistant",
                     "content": None,
                     "tool_calls": [{
-                        "id": "recovered_1",
+                        "id": recovery_id,
                         "type": "function",
                         "function": {"name": name, "arguments": json.dumps(args)},
                     }],
                 })
                 messages.append({
                     "role": "tool",
-                    "tool_call_id": "recovered_1",
+                    "tool_call_id": recovery_id,
                     "content": json.dumps(result, ensure_ascii=False),
                 })
                 malformed_retries = 0  # successful recovery, don't count it against the cap
@@ -174,18 +213,21 @@ async def run_agent(user_id: int, username: str, user_message: str) -> tuple[str
                 if name == "submit_payment_reference" and result.get("status") == "proof_submitted":
                     events.append({"type": "payment_reference", "data": result["order"]})
 
+                # Unique per recovery event — see _new_recovery_tool_call_id
+                # docstring (Issue 2.1).
+                recovery_id = _new_recovery_tool_call_id("recovered_json")
                 messages.append({
                     "role": "assistant",
                     "content": None,
                     "tool_calls": [{
-                        "id": "recovered_json_1",
+                        "id": recovery_id,
                         "type": "function",
                         "function": {"name": name, "arguments": json.dumps(args)},
                     }],
                 })
                 messages.append({
                     "role": "tool",
-                    "tool_call_id": "recovered_json_1",
+                    "tool_call_id": recovery_id,
                     "content": json.dumps(result, ensure_ascii=False),
                 })
                 malformed_retries = 0  # successful recovery, don't count it against the cap
