@@ -249,7 +249,10 @@ async def run_agent(user_id: int, username: str, user_message: str) -> tuple[str
             is_negative = any(neg in reply_lower for neg in [
                 "not added", "haven't added", "didn't add", 
                 "not placed", "haven't placed", "didn't place",
-                "not confirmed", "haven't confirmed", "didn't confirm"
+                "not confirmed", "haven't confirmed", "didn't confirm",
+                "can't add", "cannot add", "unable to add", "not able to add",
+                "can't place", "cannot place", "unable to place", "not able to place",
+                "can't confirm", "cannot confirm", "unable to confirm", "not able to confirm"
             ])
             
             if not is_negative and any(phrase in reply_lower for phrase in commitment_phrases):
