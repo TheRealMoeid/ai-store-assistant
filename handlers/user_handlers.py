@@ -31,12 +31,21 @@ async def _notify_admin(bot: Bot, event: dict):
 
     elif event["type"] == "payment_reference":
         order = event["data"]
-        await bot.send_message(
-            config.ADMIN_GROUP_ID,
-            f"💳 Payment reference for {order['order_id']} (@{order['username']}):\n"
-            f"{order['payment_proof']}\n\n"
+        lines = [
+            f"💳 Payment reference for {order['order_id']} (@{order['username']}):",
+            str(order["payment_proof"]),
+            "",
             f"Reply with /confirm {order['order_id']} or /reject {order['order_id']}",
-        )
+        ]
+        # Issue 4.2 (Option B): flag resubmissions so the seller knows the
+        # customer replaced a previously submitted proof and should look again.
+        if len(order.get("payment_proof_history", [])) > 1:
+            lines += [
+                "",
+                "⚠️ RESUBMISSION: the customer replaced a previously submitted "
+                "proof — please review the latest one.",
+            ]
+        await bot.send_message(config.ADMIN_GROUP_ID, "\n".join(lines))
 
 
 @router.message(F.photo)
@@ -59,22 +68,36 @@ async def handle_payment_screenshot(message: Message, bot: Bot):
 
     # Largest photo size is last in the list
     file_id = message.photo[-1].file_id
-    await order_manager.attach_payment_proof(order["order_id"], f"photo:{file_id}")
+    updated = await order_manager.attach_payment_proof(order["order_id"], f"photo:{file_id}")
 
-    await message.answer(
-        f"Got your payment screenshot for order {order['order_id']} — "
-        "I've sent it to the seller for confirmation. You'll hear back once it's reviewed!"
-    )
+    # Issue 4.2 (Option B): a proof attached to an order already in
+    # awaiting_review is a resubmission — the customer is replacing a
+    # previously submitted proof, and the seller should be told to look again.
+    is_resubmission = updated is not None and len(updated.get("payment_proof_history", [])) > 1
+
+    if is_resubmission:
+        await message.answer(
+            f"Got your updated payment screenshot for order {order['order_id']} — "
+            "it replaces the previous one you sent, and I've flagged the update to the "
+            "seller. You'll hear back once it's reviewed!"
+        )
+    else:
+        await message.answer(
+            f"Got your payment screenshot for order {order['order_id']} — "
+            "I've sent it to the seller for confirmation. You'll hear back once it's reviewed!"
+        )
 
     if config.ADMIN_GROUP_ID:
-        await bot.send_photo(
-            config.ADMIN_GROUP_ID,
-            file_id,
-            caption=(
-                f"💳 Payment screenshot for {order['order_id']} (@{username}, {user_id})\n\n"
-                f"Reply with /confirm {order['order_id']} or /reject {order['order_id']}"
-            ),
+        caption = (
+            f"💳 Payment screenshot for {order['order_id']} (@{username}, {user_id})\n\n"
+            f"Reply with /confirm {order['order_id']} or /reject {order['order_id']}"
         )
+        if is_resubmission:
+            caption += (
+                "\n\n⚠️ RESUBMISSION: the customer replaced a previously submitted "
+                "proof — please review the latest one."
+            )
+        await bot.send_photo(config.ADMIN_GROUP_ID, file_id, caption=caption)
 
 
 @router.message(F.text)
