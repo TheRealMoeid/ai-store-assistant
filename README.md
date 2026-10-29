@@ -234,11 +234,14 @@ The core architecture is stable and heavily hardened against common LLM failure 
 - **Basic Order Status**: Limited to `pending_confirmation`, `awaiting_review`, `confirmed`, and `rejected`.
 
 ### Backlog / Known Limitations
-- **Atomic Cart-Consumption**: The full `_place_order` sequence (read cart → validate → decrement stock → create order → clear cart) is not wrapped in a single overarching lock, meaning near-simultaneous checkout requests from the *same* user could theoretically race.
-- **Substring Color Matching**: Color matching uses `in` rather than exact `==`, which could cause inventory drift on rejection if overlapping color names exist (e.g., "Red" vs "Red/Blue").
-- **Hardcoded Recovery IDs**: Synthetic `tool_call_id`s used in malformed-call recovery are static strings; multiple recovery events in one conversation could theoretically collide.
-- **Sync File I/O**: JSON reads/writes use synchronous `open()` inside `async` functions, which blocks the event loop (acceptable at current single-seller scale).
-- **Payment Proof Resubmission**: Customers cannot easily overwrite a wrong payment screenshot once an order moves to `awaiting_review`.
+- **Sync File I/O** (Issue 3.4): JSON reads/writes use synchronous `open()` inside `async` functions, which blocks the event loop (acceptable at current single-seller scale). This is the last remaining item from the original bug audit.
+
+### Fixed in Recent Passes (previously listed here)
+- ✅ **Atomic cart-consumption** (Issue 3.1): the checkout sequence (cart read → stock validation/decrement → order creation → cart clear) is now atomic; no same-user race is possible.
+- ✅ **Substring color matching** (Issue 3.2): variant matching now uses exact color comparison, eliminating inventory drift on rejection with overlapping color names.
+- ✅ **Hardcoded recovery IDs** (Issue 2.1): synthetic recovery `tool_call_id`s are now unique per event (`uuid.uuid4().hex`), preventing duplicate-ID API errors across multiple recoveries in one conversation. Covered by `test/test_recovery_tool_call_ids.py`.
+- ✅ **Narration guard negative-phrase gap** (Issue 4.1): the guard's negative filter now also recognizes `can't / cannot / unable to / not able to` constructions, avoiding false-positive retries on legitimate refusals. Covered by `test/test_narration_guard.py`.
+- ✅ **Payment proof resubmission** (Issue 4.2, Option B): customers can now replace a submitted proof — typed references and screenshots both resolve to the customer's latest unpaid order (`pending_confirmation` **or** `awaiting_review`), every submission is appended to a per-order `payment_proof_history` audit list (pre-existing orders without the field are handled via `setdefault`, no migration needed), and admin notifications flag resubmissions with a ⚠️ RESUBMISSION notice. Covered by `test/test_payment_resubmission.py`; validated end-to-end live on 2026-10-29.
 
 ---
 
