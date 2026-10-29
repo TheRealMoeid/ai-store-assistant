@@ -43,6 +43,9 @@ async def place_order(user_id: int, username: str, items: list[dict]) -> dict:
         "items": items,
         "status": "pending_confirmation",
         "payment_proof": None,
+        # Audit trail for payment-proof resubmissions (Issue 4.2, Option B):
+        # every submission is appended below, never overwritten.
+        "payment_proof_history": [],
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     return await _append(config.ORDERS_FILE, order, _orders_lock)
@@ -54,9 +57,14 @@ def get_order(order_id: str) -> dict | None:
     return None
 
 def get_latest_unpaid_order(user_id: int) -> dict | None:
+    # Matches both orders that never had proof attached (pending_confirmation)
+    # and orders already sitting in awaiting_review. The latter is what makes
+    # resubmission reachable at all: previously this filter stopped matching
+    # the instant any proof was attached, so a customer who needed to replace
+    # their proof hit a dead end (Issue 4.2, Option B).
     matches = [
         o for o in _load(config.ORDERS_FILE)
-        if o["user_id"] == user_id and o["status"] == "pending_confirmation"
+        if o["user_id"] == user_id and o["status"] in ("pending_confirmation", "awaiting_review")
     ]
     return matches[-1] if matches else None
 
@@ -67,6 +75,15 @@ async def attach_payment_proof(order_id: str, proof: str) -> dict | None:
             if o["order_id"] == order_id:
                 o["status"] = "awaiting_review"
                 o["payment_proof"] = proof
+                # Option B (Issue 4.2): keep every submission, in order, so a
+                # resubmission is auditable and admin notifications can flag
+                # it. setdefault (rather than requiring the field at creation)
+                # keeps this safe for orders that already exist in orders.json
+                # from before this field was introduced.
+                o.setdefault("payment_proof_history", []).append({
+                    "proof": proof,
+                    "submitted_at": datetime.now(timezone.utc).isoformat(),
+                })
                 _save(config.ORDERS_FILE, records)
                 return o
         return None
