@@ -2,9 +2,13 @@
 
 Source: `bug-audit-evaluation.md` / `original-audit-report.md`, cross-checked against the current repository state. These are the four items still open after Issues 1.2, 1.3, 1.1, 3.3, 3.1, and 3.2 were fixed and merged. All four are classified **low priority** by the original audit — none are silent-failure or data-corruption bugs like the ones already fixed; they're either narrow edge cases, minor UX gaps, or scale-related concerns that don't bite at the project's current single-seller size.
 
+> **Status update (2026-10-29):** Issues **2.1, 4.1, and 4.2 are fixed and merged** into `main`. Only **Issue 3.4** (synchronous file I/O) remains open. The sections below are preserved for history; each fixed issue is marked with its resolution.
+
 ---
 
 ## Issue 2.1 — Hardcoded recovery `tool_call_id`s
+
+> **✅ FIXED (2026-10-29).** Recovery IDs are now unique per event via `_new_recovery_tool_call_id()` (`uuid.uuid4().hex`), applied at both the native-tag and leaked-JSON recovery paths. Covered by `test/test_recovery_tool_call_ids.py`.
 
 **Location:** `agent/agent.py`, in both malformed-tool-call recovery paths.
 
@@ -79,6 +83,8 @@ An alternative (rejected by the original audit) is adopting `aiofiles` for nativ
 
 ## Issue 4.1 — Narration guard's negative-phrase filter is incomplete
 
+> **✅ FIXED (2026-10-29).** The `is_negative` filter was expanded with the backlog-proposed `can't / cannot / unable to` constructions × `add / place / confirm`, plus `not able to`. The mirrored logic in `test/test_narration_guard.py` was updated in lockstep, with new overlap-case asserts (commitment phrase + refusal in one reply) that fail on the pre-fix wordlist. Residual known gap: `couldn't` / `wasn't able to` phrasings are not yet covered — to be refined from real observed model output if seen in practice.
+
 **Location:** `agent/agent.py`, inside the narration guard, in the `is_negative` check.
 
 **Current code:**
@@ -114,6 +120,8 @@ The exact wording list is a judgment call and could be refined further (e.g. "wo
 ---
 
 ## Issue 4.2 — Can't resubmit payment proof once an order is `awaiting_review`
+
+> **✅ FIXED (2026-10-29) — Option B chosen, with one deliberate deviation.** Implemented: a per-order `payment_proof_history` list (entries of `{proof, submitted_at}`) appended on every submission via `setdefault` — no migration needed for pre-existing orders; the order's `payment_proof` still holds the latest value; both admin notification paths (typed reference and screenshot) append a ⚠️ RESUBMISSION flag when history length > 1; the customer gets an explicit "replaces the previous one" confirmation on resubmission. **Deviation from the text below:** the backlog's Option B said to "keep the status filter narrow," but taken literally that leaves resubmission unreachable (nothing to track). The lookup therefore also matches `awaiting_review` — as any working fix must; Option B's actual differentiator (audit trail over silent overwrite) is fully implemented. Covered by `test/test_payment_resubmission.py`; validated end-to-end live on 2026-10-29 (reference resubmission, screenshot resubmission with admin flag, `/pending_orders` reflection, `/confirm` after resubmission).
 
 **Location:** `utils/order_manager.py::get_latest_unpaid_order()`.
 
@@ -165,11 +173,11 @@ Keep the status filter narrow, but add a small history/log of proof submissions 
 
 ## Summary table
 
-| Issue | Area | Severity | Effort | Touches |
-|---|---|---|---|---|
-| 2.1 | Recovery `tool_call_id`s | Medium (rare trigger) | Very low | `agent/agent.py` only |
-| 3.4 | Sync file I/O | Low (current scale) | Medium (broad but mechanical) | All 4 `utils/*_manager.py` files |
-| 4.1 | Narration guard negative-phrase gap | Low | Very low | `agent/agent.py` only |
-| 4.2 | Can't resubmit payment proof | Low-to-moderate UX | Low (Option A) / Medium (Option B) | `utils/order_manager.py`, possibly `handlers/*` |
+| Issue | Area | Severity | Effort | Touches | Status |
+|---|---|---|---|---|---|
+| 2.1 | Recovery `tool_call_id`s | Medium (rare trigger) | Very low | `agent/agent.py` only | ✅ Fixed (2026-10-29) |
+| 3.4 | Sync file I/O | Low (current scale) | Medium (broad but mechanical) | All 4 `utils/*_manager.py` files | ⏳ **Open — last remaining item** |
+| 4.1 | Narration guard negative-phrase gap | Low | Very low | `agent/agent.py` only | ✅ Fixed (2026-10-29) |
+| 4.2 | Can't resubmit payment proof | Low-to-moderate UX | Low (Option A) / Medium (Option B) | `utils/order_manager.py`, `handlers/user_handlers.py` | ✅ Fixed (2026-10-29, Option B) |
 
-**Suggested order if tackled together:** 2.1 → 4.1 (both trivial, same file, could even be one combined small PR) → 4.2 (contained but needs an explicit approach decision first) → 3.4 (broadest change, best done as its own dedicated pass with full regression testing given how many files it touches).
+**Suggested next step:** only Issue 3.4 remains. Given its breadth, do it as its own dedicated branch with the full regression suite run afterward.
