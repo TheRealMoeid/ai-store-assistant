@@ -3,6 +3,10 @@
 # Run directly: python test/test_payment_resubmission.py
 # (Not pytest-discovered: contains no module-level test_* functions, like
 # test_narration_guard.py.)
+#
+# Updated for Issue #16 (bug-audit 3.4, async/atomic file I/O):
+# order_manager.get_order() is now async + locked, so step 4's call below
+# is now awaited. No other behavior in this file changes.
 import asyncio
 import json
 import os
@@ -43,7 +47,7 @@ async def main():
     assert not (len(updated.get("payment_proof_history", [])) > 1)
 
     # 2. Core Issue 4.2 bug: the lookup must still find the awaiting_review order.
-    found = order_manager.get_latest_unpaid_order(1001)
+    found = await order_manager.get_latest_unpaid_order(1001)
     assert found is not None and found["order_id"] == order["order_id"]
 
     # 3. Resubmission: the replacement is recorded, not rejected; status is
@@ -59,7 +63,9 @@ async def main():
     updated3 = await order_manager.attach_payment_proof(order["order_id"], "photo:fileid_1")
     assert len(updated3["payment_proof_history"]) == 3
     assert updated3["payment_proof"] == "photo:fileid_1"
-    reloaded = order_manager.get_order(order["order_id"])
+    # order_manager.get_order is now async + locked (Issue #16) — was a
+    # plain synchronous unlocked read before this fix.
+    reloaded = await order_manager.get_order(order["order_id"])
     assert len(reloaded["payment_proof_history"]) == 3
 
     # 5. Legacy orders (created before payment_proof_history existed) must not
@@ -84,11 +90,12 @@ async def main():
     # 6. Confirmed orders are excluded from the lookup; a newer pending order
     #    for the same user is returned instead.
     await order_manager.set_order_status(order["order_id"], "confirmed")
-    assert order_manager.get_latest_unpaid_order(1001) is None
+    assert await order_manager.get_latest_unpaid_order(1001) is None
     newer = await order_manager.place_order(1001, "alice", [
         {"product_id": "p003", "size": "S", "color": "green", "quantity": 1},
     ])
-    assert order_manager.get_latest_unpaid_order(1001)["order_id"] == newer["order_id"]
+    latest = await order_manager.get_latest_unpaid_order(1001)
+    assert latest["order_id"] == newer["order_id"]
 
     print("✅ SUCCESS: Payment-proof resubmission tracking works (Issue 4.2, Option B).")
 

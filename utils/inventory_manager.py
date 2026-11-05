@@ -9,12 +9,36 @@ places that *write* to inventory.json. decrement_stock_for_cart is called
 from place_order once an order is placed; restore_stock_for_order is called
 from the /reject admin command to give that reserved stock back. Both hold
 _inventory_lock and validate before writing.
+
+Issue #16 (bug-audit 3.4): the two writers below now build the new data in
+memory (still inside _inventory_lock, synchronously — all pure in-memory
+dict mutation, no I/O) and then offload the actual disk write to a worker
+thread via utils.file_io.write_json_atomic (atomic temp-file + os.replace),
+so the event loop isn't blocked for the write's duration.
+
+The read side (_load_if_changed, and everything built on it —
+get_product_by_id, search_products, check_variant) deliberately stays
+synchronous. Two reasons:
+  1. These are called from many sync call sites throughout agent/tools.py
+     and making them async would ripple through that whole file for a read
+     that's already cheap (an os.stat() plus, only on a changed mtime, one
+     JSON parse of a seller-sized catalog — not the append-only,
+     ever-growing files the other three managers deal with).
+  2. Now that writes are atomic (temp file + os.replace), a read landing
+     concurrently with a write can only ever see the fully-old or
+     fully-new file, never a torn one — the one hazard offloading would
+     have otherwise introduced is already closed by the atomic write
+     itself, so there's no correctness reason to also make the read async.
+_cache is still only ever mutated from the event-loop thread: the writers
+do their file_io.write_json_atomic() await (which runs on a worker thread),
+then invalidate _cache["mtime"] back on the loop thread afterward, same as
+before this fix — no cross-thread cache mutation was introduced.
 """
 import json
 import logging
 import asyncio
 import config
-from utils import order_manager
+from utils import order_manager, file_io
 
 logger = logging.getLogger("inventory_manager")
 
@@ -85,9 +109,11 @@ async def decrement_stock_for_cart(cart_items: list[dict]) -> dict:
     the operation aborts and NO changes are written to disk.
     """
     async with _inventory_lock:
-        # 1. Read current state from disk
-        with open(config.INVENTORY_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        # 1. Read current state from disk. Reading inline here (not via
+        # _load_if_changed's cache) matches the pre-Issue-#16 behavior —
+        # this function always wants the absolute latest on-disk state
+        # right before a write, not a possibly-stale cached copy.
+        data = await file_io.read_json(config.INVENTORY_FILE, {"products": []})
 
         # 2. Phase 1: Validate all items in the cart
         for item in cart_items:
@@ -126,11 +152,15 @@ async def decrement_stock_for_cart(cart_items: list[dict]) -> dict:
                 v["stock"] = v.get("stock", 0) - take
                 remaining -= take
 
-        # 4. Write the fully updated inventory back to disk
-        with open(config.INVENTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        # 4. Write the fully updated inventory back to disk — offloaded to a
+        # worker thread and atomic (temp file + os.replace), so the event
+        # loop isn't blocked and a concurrent reader can never see a torn
+        # file (Issue #16).
+        await file_io.write_json_atomic(config.INVENTORY_FILE, data)
 
-        # Invalidate cache so next read gets the fresh data
+        # Invalidate cache so next read gets the fresh data. Done back on
+        # the event-loop thread, after the to_thread() write has returned —
+        # _cache is never touched from the worker thread itself.
         _cache["mtime"] = None
         return {"status": "ok"}
 
@@ -165,7 +195,9 @@ async def restore_stock_for_order(order_id: str) -> dict:
     (admin_handlers.reject_order) surfaces "skipped" to the admin so the
     seller can reconcile it by hand instead of it silently vanishing.
     """
-    order = order_manager.get_order(order_id)
+    # order_manager.get_order is now async + locked (Issue #16) — awaited
+    # here instead of called directly.
+    order = await order_manager.get_order(order_id)
     if not order:
         return {"error": f"order '{order_id}' not found"}
 
@@ -174,8 +206,7 @@ async def restore_stock_for_order(order_id: str) -> dict:
         return {"status": "ok", "restored": [], "skipped": []}
 
     async with _inventory_lock:
-        with open(config.INVENTORY_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = await file_io.read_json(config.INVENTORY_FILE, {"products": []})
 
         restored = []
         skipped = []
@@ -210,9 +241,8 @@ async def restore_stock_for_order(order_id: str) -> dict:
             restored.append(item)
 
         if restored:
-            with open(config.INVENTORY_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            # Invalidate cache so next read gets the fresh data
+            await file_io.write_json_atomic(config.INVENTORY_FILE, data)
+            # Invalidate cache so next read gets the fresh data.
             _cache["mtime"] = None
 
         return {"status": "ok", "restored": restored, "skipped": skipped}

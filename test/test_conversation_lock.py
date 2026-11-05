@@ -37,6 +37,45 @@ This suite covers three things:
 Sandboxes config.CONVERSATIONS_DIR to a throwaway test_data/conversations
 directory, matching the project's established sandboxing pattern, so real
 data/conversations/ is never touched.
+
+Updated for Issue #16 (bug-audit 3.4, async/atomic file I/O). Before that
+fix, _load_history_sync/_append_messages_sync were pure synchronous code
+with no actual `await` inside the critical section, so even a "concurrent"
+asyncio.gather() of many append_messages() calls never genuinely
+interleaved on the lock -- each acquire()/do-work/release() ran as one
+uninterrupted burst, since asyncio.Lock's uncontended fast path never
+yields to the loop at all. (This project already hit the exact same gap
+for _checkout_lock -- see test_checkout_atomicity.py's
+_widen_race_window() docstring -- and had to force genuine interleaving
+there with an artificial await point.) Post-Issue-#16, the sync helpers
+now call `await asyncio.to_thread(...)` inside the lock -- a real yield
+point -- so concurrent calls to append_messages()/load_history() genuinely
+contend _history_lock for the first time.
+
+That's a good thing (it's what makes the concurrency tests below actually
+test something), but it surfaces the same pytest-asyncio cross-test
+artifact already documented for _checkout_lock: asyncio.Lock only binds
+itself to a specific running event loop the first time it's genuinely
+contended (its fast, uncontended path never touches the loop). Since
+_history_lock is a module-level singleton shared across every test
+function in this file, and pytest-asyncio gives each test function its
+own fresh event loop by default, a test that genuinely contends the lock
+binds it to that test's loop -- and a *later* test that also genuinely
+contends it raises "is bound to a different event loop" (confirmed live:
+test_concurrent_appends_for_different_users_dont_interfere and
+test_load_history_and_append_messages_interleaved_no_deadlock both failed
+this way on a real `pytest . -v` run once Issue #16 landed, even though
+both had always passed before -- their own logic didn't change, only
+_history_lock's new genuine contention did). This is purely a
+test-isolation artifact, not a real bug: the actual bot process has
+exactly one long-lived event loop for its whole lifetime, so it never
+occurs in production. The three tests that actually drive genuine
+concurrent contention on _history_lock (via asyncio.gather of multiple
+tasks that each hit a real await inside the lock) now take a `monkeypatch`
+fixture and reset `conversation_manager._history_lock` to a fresh
+`asyncio.Lock()` at the start of the test, exactly mirroring
+test_checkout_atomicity.py's existing `_widen_race_window()` workaround
+for `_checkout_lock`.
 """
 import sys
 from pathlib import Path
@@ -68,6 +107,22 @@ def setup_test_data():
         f.unlink()
 
 
+def _fresh_history_lock(monkeypatch):
+    """
+    Gives _history_lock a brand-new asyncio.Lock() instance bound to THIS
+    test's event loop, instead of reusing the module-level singleton that
+    may already be bound to an earlier test's (now-closed) loop. See the
+    module docstring above for why this became necessary once Issue #16
+    made the lock genuinely contendable. Only needed by tests that
+    actually drive real concurrent contention on the lock (multiple tasks
+    via asyncio.gather, each hitting a genuine await inside the locked
+    section) -- single-call tests and tests that only await sequentially
+    in a loop (no gather) never contend the lock for real and don't need
+    this.
+    """
+    monkeypatch.setattr(conversation_manager, "_history_lock", asyncio.Lock())
+
+
 def _msg(i: int) -> dict:
     return {"role": "user", "content": f"message {i}"}
 
@@ -75,14 +130,17 @@ def _msg(i: int) -> dict:
 # --- core race-condition fix ---------------------------------------------
 
 @pytest.mark.asyncio
-async def test_concurrent_appends_lose_no_messages():
+async def test_concurrent_appends_lose_no_messages(monkeypatch):
     """
     Core Issue 3.3 case: fire off many concurrent append_messages() calls
     for the same user and confirm every single message survives to disk.
-    Before the fix (no lock at all), concurrent calls would race on the
-    read-modify-write cycle and silently drop messages -- the final file
-    would have fewer than `num_appends` entries.
+    Before the fix, no lock at all meant concurrent calls would race on the
+    read-modify-write cycle and silently drop messages. Post-Issue-#16, this
+    is also the first test in the file to genuinely contend _history_lock
+    (asyncio.to_thread inside the lock is a real yield point) -- see the
+    module docstring for why that needs a fresh per-test lock instance.
     """
+    _fresh_history_lock(monkeypatch)
     user_id = 1
     num_appends = 50
 
@@ -105,13 +163,17 @@ async def test_concurrent_appends_lose_no_messages():
 
 
 @pytest.mark.asyncio
-async def test_concurrent_appends_for_different_users_dont_interfere():
+async def test_concurrent_appends_for_different_users_dont_interfere(monkeypatch):
     """
     Sanity check that the single global lock (Approach A) still produces
-    correct per-user results even though it serializes across users --
-    correctness must hold regardless of the throughput trade-off. Each
-    user's file should contain exactly and only that user's messages.
+    correct results across DIFFERENT users -- correctness must hold
+    regardless of the throughput trade-off. Each user's file should contain
+    exactly and only that user's messages. Genuinely contends
+    _history_lock (via gather), so needs a fresh instance -- see module
+    docstring.
     """
+    _fresh_history_lock(monkeypatch)
+
     async def append_for_user(user_id: int, n: int):
         await asyncio.gather(*[
             conversation_manager.append_messages(user_id, [_msg(i)])
@@ -146,6 +208,11 @@ async def test_get_recent_for_llm_does_not_deadlock_under_concurrent_writes():
     hang instead of completing. asyncio.wait_for gives it a generous but
     finite timeout so a real deadlock fails loudly instead of hanging the
     whole test run.
+
+    No fresh-lock workaround needed here: the calls below are sequential
+    awaits inside one loop (no asyncio.gather of multiple tasks), so this
+    test never genuinely contends _history_lock across overlapping tasks
+    -- it's a deadlock check, not a contention/throughput check.
     """
     user_id = 2
     await conversation_manager.append_messages(user_id, [_msg(0)])
@@ -162,11 +229,15 @@ async def test_get_recent_for_llm_does_not_deadlock_under_concurrent_writes():
 
 
 @pytest.mark.asyncio
-async def test_load_history_and_append_messages_interleaved_no_deadlock():
+async def test_load_history_and_append_messages_interleaved_no_deadlock(monkeypatch):
     """Same deadlock concern as above, but explicitly interleaving
     load_history() (not just get_recent_for_llm) with concurrent
-    append_messages() calls, since load_history() is also a public locked
-    wrapper now."""
+    append_messages() calls via two gathered tasks, since load_history() is
+    also a public locked wrapper now. This DOES genuinely contend
+    _history_lock (two concurrent tasks via gather, each with a real await
+    inside the lock post-Issue-#16), so it needs a fresh lock instance --
+    see module docstring."""
+    _fresh_history_lock(monkeypatch)
     user_id = 3
 
     async def writer():
@@ -254,6 +325,22 @@ def main():
     matching the style of the other root-level test_*.py files."""
     import inspect
 
+    class _Monkeypatch:
+        """Minimal stand-in for pytest's `monkeypatch` fixture, matching
+        the shim already used by test_leaked_json_recovery.py,
+        test_narration_guard_loop.py, and test_checkout_atomicity.py for
+        their own monkeypatch-taking tests when run outside pytest."""
+        def __init__(self):
+            self._undo = []
+
+        def setattr(self, obj, name, value):
+            self._undo.append((obj, name, getattr(obj, name)))
+            setattr(obj, name, value)
+
+        def undo(self):
+            for obj, name, value in reversed(self._undo):
+                setattr(obj, name, value)
+
     test_fns = [
         (name, fn) for name, fn in globals().items()
         if name.startswith("test_") and inspect.iscoroutinefunction(fn)
@@ -262,12 +349,21 @@ def main():
     for name, fn in test_fns:
         for f in TEST_CONVERSATIONS_DIR.glob("*.json"):
             f.unlink()
+
+        needs_monkeypatch = "monkeypatch" in inspect.signature(fn).parameters
+        mp = _Monkeypatch() if needs_monkeypatch else None
         try:
-            asyncio.run(fn())
+            if needs_monkeypatch:
+                asyncio.run(fn(mp))
+            else:
+                asyncio.run(fn())
             print(f"✅ {name}")
             passed += 1
         except Exception as e:
             print(f"❌ {name}: {e}")
+        finally:
+            if mp:
+                mp.undo()
     for f in TEST_CONVERSATIONS_DIR.glob("*.json"):
         f.unlink()
     print(f"\n{passed}/{len(test_fns)} passed")

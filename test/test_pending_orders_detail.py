@@ -20,6 +20,14 @@ Sandboxes config paths to test_data/, matching test_stock_reversal.py and
 test/test_backend.py, so real data/ is never touched. Uses the same
 lightweight FakeMessage double as test_stock_reversal.py / test_admin_auth.py
 rather than spinning up a real aiogram Dispatcher.
+
+Updated for Issue #16 (bug-audit 3.4, async/atomic file I/O): the
+_seed_order() helper below calls order_manager._load()/_save() directly to
+mutate a seeded order's status/proof (there's no public order_manager API
+for that), and both are now async (offloaded to a worker thread, atomic
+write) instead of plain sync calls — so this helper now awaits them. No
+other test in this file changes: every other order_manager call it makes
+(place_order, get_all_orders) was already async and already awaited.
 """
 import sys
 from pathlib import Path
@@ -95,13 +103,21 @@ def setup_test_data():
 async def _seed_order(user_id: int, username: str, items: list[dict], status: str = "pending_confirmation", proof=None) -> dict:
     order = await order_manager.place_order(user_id, username, items)
     if status != "pending_confirmation" or proof is not None:
-        records = order_manager._load(config.ORDERS_FILE)
+        # order_manager._load()/_save() are now async (Issue #16: offloaded
+        # to a worker thread, atomic temp-file + os.replace write) — were
+        # plain sync calls before this fix. There's no public order_manager
+        # API for directly overwriting status/proof on an existing order
+        # (that's intentionally only reachable via the real transitions
+        # like attach_payment_proof/set_order_status), so this test helper
+        # still reaches into the "private" _load/_save pair, just awaited
+        # now like every other order_manager call.
+        records = await order_manager._load(config.ORDERS_FILE)
         for o in records:
             if o["order_id"] == order["order_id"]:
                 o["status"] = status
                 o["payment_proof"] = proof
-        order_manager._save(config.ORDERS_FILE, records)
-        order = order_manager.get_order(order["order_id"])
+        await order_manager._save(config.ORDERS_FILE, records)
+        order = await order_manager.get_order(order["order_id"])
     return order
 
 
