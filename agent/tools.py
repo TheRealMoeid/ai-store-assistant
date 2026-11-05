@@ -352,7 +352,9 @@ async def _place_order(args: dict, ctx: dict) -> dict:
         return {"status": "order_placed", "order": order}
 
 async def _submit_payment_reference(args: dict, ctx: dict) -> dict:
-    order = order_manager.get_latest_unpaid_order(ctx["user_id"])
+    # order_manager.get_latest_unpaid_order is now async + locked (Issue #16)
+    # — was a plain synchronous unlocked read.
+    order = await order_manager.get_latest_unpaid_order(ctx["user_id"])
     if not order:
         return {"error": "no order awaiting payment for this customer"}
     updated = await order_manager.attach_payment_proof(order["order_id"], args["reference"])

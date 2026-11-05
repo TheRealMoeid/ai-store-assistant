@@ -16,6 +16,18 @@ Two layers are tested:
      handler, using lightweight fake aiogram objects (Message/CommandObject/
      Bot) rather than spinning up a real Dispatcher, same approach as
      test_admin_auth.py.
+
+Updated for Issue #16 (bug-audit 3.4, async/atomic file I/O):
+order_manager.get_order() is now async + locked (previously a plain
+synchronous unlocked read), so the two call sites below that use it
+(test_reject_order_handler_restores_stock,
+test_reject_order_handler_warns_on_skipped_variant) now await it. This was
+missed in the initial Issue #16 patch — caught by a live `pytest . -v` run
+(TypeError: 'coroutine' object is not subscriptable, plus a "coroutine
+'get_order' was never awaited" RuntimeWarning) rather than during review,
+since every OTHER call in this file already went through async APIs
+(place_order, reject_order) and nothing here is itself new to Issue #16's
+scope — this is the one spot that quietly called the old sync signature.
 """
 import sys
 from pathlib import Path
@@ -231,7 +243,9 @@ async def test_reject_order_handler_restores_stock():
     # No skipped-variant warning expected in the normal case.
     assert not any("⚠️" in r for r in message.replies)
 
-    updated = order_manager.get_order(order["order_id"])
+    # order_manager.get_order is now async + locked (Issue #16) — was a
+    # plain synchronous unlocked read before this fix.
+    updated = await order_manager.get_order(order["order_id"])
     assert updated["status"] == "rejected"
 
     # Customer gets DM'd.
@@ -287,7 +301,8 @@ async def test_reject_order_handler_warns_on_skipped_variant():
     await reject_order(message, FakeCommand(order["order_id"]), bot)
 
     # Order still gets marked rejected even though stock couldn't be restored.
-    updated = order_manager.get_order(order["order_id"])
+    # order_manager.get_order is now async + locked (Issue #16).
+    updated = await order_manager.get_order(order["order_id"])
     assert updated["status"] == "rejected"
 
     # Admin sees an explicit warning naming the affected product.

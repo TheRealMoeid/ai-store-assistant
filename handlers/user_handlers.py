@@ -58,7 +58,9 @@ async def handle_payment_screenshot(message: Message, bot: Bot):
     user_id = message.from_user.id
     username = message.from_user.username or message.from_user.full_name
 
-    order = order_manager.get_latest_unpaid_order(user_id)
+    # order_manager.get_latest_unpaid_order is now async + locked (Issue #16)
+    # — was a plain synchronous unlocked read.
+    order = await order_manager.get_latest_unpaid_order(user_id)
     if not order:
         await message.answer(
             "I don't see an order waiting on payment for you right now — "
