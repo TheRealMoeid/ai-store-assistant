@@ -31,13 +31,15 @@ utils/
   inventory_manager.py    reads data/inventory.json, reloads on mtime change; owns both stock-writing
                            paths — decrement_stock_for_cart (at place_order) and restore_stock_for_order
                            (at /reject). Imports order_manager (one-directional — see constraint below).
-  cart_manager.py         per-user cart, persisted to data/carts.json so carts survive restarts
+  cart_manager.py          per-user cart, persisted to data/carts.json so carts survive restarts
                            (checkout atomicity itself lives in agent/tools.py's _checkout_lock —
                            see "Checkout atomicity" below, not in this file)
   conversation_manager.py per-user chat history, persisted in full but trimmed for LLM context;
                            guarded by a single asyncio.Lock (see "Conversation history locking" below)
   order_manager.py        orders.json + feedback.json read/write, order status lifecycle, including
                            the atomic set_order_status_if_not() used for idempotent rejection
+  file_io.py               shared async/atomic JSON read-write helpers used by all four managers above
+                           (see "Async file I/O" below)
 data/
   inventory.json           seller edits this directly
   orders.json               order status: pending_confirmation -> awaiting_review -> confirmed|rejected
@@ -91,7 +93,10 @@ now persisted to `data/carts.json`, keyed by `str(user_id)`, guarded by an
 `asyncio.Lock` matching the read-modify-write pattern already used in
 `order_manager.py`. An empty cart is removed from the file entirely rather
 than stored as `[]`, to keep the file small. Covered by
-`test_cart_persistence.py`.
+`test_cart_persistence.py`. The actual file I/O inside `_carts_lock` now
+goes through `utils/file_io.py` (offloaded to a worker thread, atomic write)
+— see "Async file I/O" below; the locking and empty-cart-removal behavior
+described above are unchanged.
 
 ## Conversation history locking (utils/conversation_manager.py) — fixed, was Issue 3.3
 **Previously:** `append_messages()` did a raw read-modify-write
@@ -156,6 +161,14 @@ venv (both `pytest . -v` and the standalone
 `python test_conversation_lock.py` runner passed) and manually against the
 live bot.
 
+**Update (Issue #16, Nov 2026):** `_load_history_sync`/
+`_append_messages_sync` now delegate their actual file I/O to
+`utils/file_io.py` (offloaded to a worker thread, atomic write) instead of
+calling `open()`/`json` directly — see "Async file I/O" below for why, and
+for the pytest-asyncio cross-test lock-binding fix this required in
+`test_conversation_lock.py`'s two genuinely-concurrent tests. The locking
+design and sync/async split described above are otherwise unchanged.
+
 ## Stock integrity at checkout (utils/inventory_manager.py)
 `decrement_stock_for_cart()` is the write path at order placement time. It's
 called from `_place_order` in `agent/tools.py` and is atomic per cart:
@@ -208,6 +221,16 @@ regression checks. Full suite verified at 55/55 (`pytest . -v`), no
 regressions. Branch `issue-6-Multi-item-Cart`, merged to `main` (Aug 2026).
 Verified independently by Moeid on his own Windows venv (`pytest . -v` →
 all passed) and manually against the live bot.
+
+**Update (Issue #16, Nov 2026):** the actual disk read/write inside
+`decrement_stock_for_cart`/`restore_stock_for_order` now goes through
+`utils/file_io.py` (offloaded to a worker thread, atomic write) instead of
+calling `open()`/`json` directly inside `_inventory_lock`. The sync,
+unlocked read helpers (`get_product_by_id`/`search_products`/
+`check_variant`, built on `_load_if_changed`) deliberately stay
+synchronous — see "Async file I/O" below for the full reasoning, including
+why those specific unlocked reads were the main motivation for adding
+atomic writes in the first place.
 
 ## Checkout atomicity (agent/tools.py) — fixed, was Issue #10 / bug-audit 3.1
 **Previously:** `_place_order` read the cart, validated stock, decremented
@@ -336,6 +359,192 @@ The chosen design (**global `_checkout_lock` in `agent/tools.py`, held for
 the whole `_place_order` body, cart cleared only on success**) is what's
 implemented above.
 
+## Async file I/O (utils/file_io.py) — fixed, was Issue 3.4 / GitHub #16
+**Previously:** all four managers (`cart_manager.py`, `order_manager.py`,
+`conversation_manager.py`, `inventory_manager.py`) called plain, blocking
+`open()`/`json.load`/`json.dump` directly inside `async def` functions,
+e.g.:
+```python
+def _save(carts: dict[str, list[dict]]):
+    with open(config.CARTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(carts, f, ensure_ascii=False, indent=2)
+```
+Python's `asyncio` event loop is single-threaded: when a coroutine calls a
+blocking function like this, control doesn't return to the loop until the
+call completes. Because `aiogram`'s polling model runs all incoming
+Telegram updates (and the bot's own outgoing calls — typing indicators,
+message sends) on that same loop, a slow disk write during, say,
+`order_manager.place_order()` would stall every other concurrent user's
+updates for the duration of that write, not just the user placing the
+order. At this project's file sizes, individual writes were fast enough
+(milliseconds) that this was unlikely to be user-noticeable, so it stayed a
+documented, low-priority backlog item (bug-audit Issue 3.4) rather than an
+urgent fix — see `docs/backlog-issues-2.1-3.4-4.1-4.2.md` for the original
+write-up and cost/benefit discussion.
+
+**Now:**
+- A new shared module, `utils/file_io.py`, provides `read_json`/
+  `write_json_atomic` (async, offload the actual blocking work to a worker
+  thread via `asyncio.to_thread()`) and their `_sync` counterparts (for
+  callers — like `conversation_manager.py`'s existing sync-core helpers —
+  that already run inside `asyncio.to_thread()` themselves). All four
+  managers now call these instead of `open()`/`json` directly, each still
+  from *inside* its own existing lock (`_carts_lock`, `_orders_lock`,
+  `_history_lock`, `_inventory_lock`) — the locks and the sync-core/
+  locked-async-wrapper split each manager already had are completely
+  unchanged; only the I/O *inside* those critical sections moved off the
+  event-loop thread.
+- **Writes are atomic**, not a plain truncate-then-write: `write_json_atomic`
+  serializes to a temp file in the same directory, then `os.replace()`s it
+  into place. This is not optional polish — it's required *because* of the
+  move to threads. Before this fix, every read and every write ran on the
+  single event-loop thread, so a read could never physically overlap a
+  write; a plain truncate-then-write was safe by construction. Once writes
+  run on a worker thread while the loop thread keeps servicing other
+  coroutines (including other reads), that guarantee disappears — a naive
+  write would let a concurrent reader observe a half-written (torn) file
+  mid-write. Atomic replace means a reader always sees either the fully-old
+  or fully-new file, never a partial one.
+- **`order_manager.get_order()` and `get_latest_unpaid_order()` are now
+  async and locked**, mirroring `get_all_orders()` (which already was
+  both). They were plain synchronous, unlocked reads before this fix — safe
+  only because, again, nothing could run concurrently with them on the
+  single event-loop thread. All three call sites that used the old sync
+  signature were updated to `await`: `agent/tools.py::_submit_payment_reference`,
+  `handlers/user_handlers.py::handle_payment_screenshot`, and two direct
+  calls inside `test/test_stock_reversal.py`.
+- `cart_manager.py`'s and `conversation_manager.py`'s reads already always
+  went through the same lock as their writes (`get_cart`/`set_cart` both
+  hold `_carts_lock`; `load_history`/`append_messages`/`get_recent_for_llm`
+  all hold `_history_lock`), so for those two files there was never a
+  genuinely unlocked reader — the atomic-write layer closes a hazard that,
+  for those two, is mostly theoretical. The real motivation for atomic
+  writes is **`inventory_manager.py`**: `get_product_by_id`/
+  `search_products`/`check_variant` (built on the mtime-cached
+  `_load_if_changed`) are *deliberately* synchronous and unlocked — they're
+  called from many places throughout `agent/tools.py` for cheap reads, and
+  making them async/locked would ripple through that whole file for a read
+  that's normally just an `os.stat()`. Those unlocked reads can now
+  genuinely race `decrement_stock_for_cart`'s/`restore_stock_for_order`'s
+  locked, threaded writes — atomic replace is what keeps that race safe
+  (old-or-new, never torn) rather than requiring those reads to be locked
+  too.
+
+**Read-side retry — found via live testing, not anticipated up front.**
+A first live `pytest . -v` run on Moeid's Windows venv surfaced a real gap
+the design above didn't account for: even with writes atomic, a concurrent
+`open(path, "r")` can transiently raise `PermissionError` on Windows
+(`OSError` errno 13, "the process cannot access the file because it is
+being used by another process") while another thread's `os.replace()` is
+in flight — a sharing-violation window, not data corruption (the write was
+never actually torn). This showed up as 3 failures out of 80 concurrent
+operations in `test/test_async_file_io.py`'s stress test. The write side
+already retried around `os.replace()` for the same class of Windows
+contention; the read side didn't. Fixed by adding the same short,
+bounded, exponential-backoff retry to `read_json_sync` — confirmed resolved
+on a second live run (93/93, full suite).
+
+**Follow-up fix (Nov 2026): the retry logic was built but not fully wired
+up.** A post-merge review (after the 93/93 run above, on `main`) traced
+every call site that touches inventory's `_cache` and found that
+`_load_if_changed()` — `inventory_manager.py`'s own mtime-cached read
+helper, underneath `get_product_by_id`/`search_products`/`check_variant`
+— still had its own bare `open()`/`json.load()` call instead of going
+through `read_json_sync()`. This is the *exact* reader the read-side-retry
+fix above was written for (unlocked, called constantly from
+`agent/tools.py`, genuinely races `decrement_stock_for_cart`'s/
+`restore_stock_for_order`'s threaded writes) — the retry logic existed in
+`file_io.py`, but this one caller never actually used it, so it remained
+exposed to the same transient Windows `PermissionError` the stress test
+had already caught and "fixed" everywhere else. An unhandled hit here
+doesn't crash the bot — `call_tool()`'s broad `except Exception` catches
+it — but it surfaces as a spurious `"tool failed: [Errno 13] ..."` to the
+customer for what should have been an ordinary read, exactly the kind of
+concurrent-load flakiness Issue #16 was meant to close. Confirmed real (not
+theoretical) by temporarily reverting `_load_if_changed()` to its
+pre-follow-up form and rerunning the new test below against it: 4 of 7
+cases failed there with the literal `PermissionError`.
+
+Fixed by routing `_load_if_changed()`'s inner read through
+`file_io.read_json_sync()`, same as every other reader. The outer mtime
+check (`config.INVENTORY_FILE.stat().st_mtime`) is unchanged. As a side
+note from tracing this: `_cache`'s own dict mutations were never actually
+racy in the first place — every mutation (here and in the two writers'
+post-write invalidation) runs on the event-loop thread with no `await`
+between a write completing and `_cache["mtime"] = None` running, so they
+can never interleave with another coroutine. The gap was specifically the
+unprotected file read, not the cache dict.
+
+Covered by `test/test_inventory_read_retry.py` (7 tests): the core case
+(`_load_if_changed()` survives a simulated transient `PermissionError`,
+same shape as the Windows race in `test_async_file_io.py`'s stress test);
+the same race exercised through `get_product_by_id`/`search_products`/
+`check_variant` — the actual call sites `agent/tools.py` uses, since
+that's what a customer-facing failure looks like in practice; a
+regression check that the error still propagates once `file_io`'s retry
+budget is genuinely exhausted (this fix must not turn a permanently-locked
+file into a silently-swallowed error); and two regression checks for
+plain uncontended reads and the existing mtime-based cache invalidation
+(editing `inventory.json` by hand is still picked up on the next call).
+Sanity-checked against the pre-follow-up code — 4/7 correctly failed
+there. No branch yet at time of writing; apply alongside
+`utils/inventory_manager.py`'s updated `_load_if_changed()`.
+
+**Two more live-only findings, both fixed, neither in `file_io.py` itself:**
+- `test/test_stock_reversal.py` had two direct calls to
+  `order_manager.get_order(...)` that were never updated to `await` in the
+  initial patch — a plain oversight (every other call in that file already
+  went through async APIs, so this one slipped past review). Confirmed via
+  `pytest`'s own `TypeError: 'coroutine' object is not subscriptable` plus
+  a `RuntimeWarning: coroutine 'get_order' was never awaited`. Fixed by
+  adding `await` at both sites.
+- `test/test_conversation_lock.py`'s two genuinely-concurrent tests
+  (`test_concurrent_appends_for_different_users_dont_interfere`,
+  `test_load_history_and_append_messages_interleaved_no_deadlock`) started
+  failing with `RuntimeError: ... is bound to a different event loop`. This
+  is **not a regression** — it's the exact same pytest-asyncio cross-test
+  lock-binding artifact already documented above under "Checkout atomicity"
+  for `_checkout_lock`, now showing up for `_history_lock` for the first
+  time. Before this fix, `_load_history_sync`/`_append_messages_sync` were
+  pure synchronous code with no real `await` inside the locked section, so
+  even a genuinely-concurrent `asyncio.gather()` of many `append_messages()`
+  calls never actually interleaved on the lock — `asyncio.Lock`'s
+  uncontended fast path never yields to the loop or binds itself to it
+  (this project hit the exact same gap originally during Issue 3.3's own
+  development, which is why that fix needed a separate thread-pool repro
+  rather than a plain `asyncio.gather()` to prove the race was real — see
+  above). Post-Issue-#16, `asyncio.to_thread()` inside the lock is a real
+  yield point, so `_history_lock` is genuinely contended across concurrent
+  tasks for the first time — which is a *correctness improvement* to the
+  tests (they now test real interleaving instead of a sequential burst that
+  merely looked concurrent), but it also means `_history_lock`, a
+  module-level singleton shared across every test function in the file,
+  can now bind itself to one test's event loop and then clash with a
+  later test's different loop. Fixed the same way as `_checkout_lock`: the
+  two affected tests now take `monkeypatch` and reset
+  `conversation_manager._history_lock` to a fresh `asyncio.Lock()` instance
+  at the start of the test.
+
+Covered by `test/test_async_file_io.py` (8 tests): the core Issue #16 case
+— a coroutine ticking on the event loop keeps running (confirmed via tick
+count) while a patched, deliberately slow `write_json_atomic_sync` sleeps
+in a worker thread, proving the write no longer blocks the loop; a
+concurrent-readers-and-writers stress test (40 writers + 40 readers, one
+shared file) asserting zero `JSONDecodeError`/malformed-read errors — this
+is what caught the Windows `PermissionError` read-side gap above; atomic-
+write unit tests (no leftover temp files, a later write fully replaces
+earlier content rather than merging, retries past a transient
+`PermissionError` on `os.replace()`, and still raises — without leaving a
+temp file behind — if every retry is exhausted); and a regression check
+that a missing file still returns the caller's default, both sync and
+async. Also required `await`-only updates (no logic changes) in
+`agent/tools.py`, `handlers/user_handlers.py`, and the two existing test
+files noted above wherever they called the newly-async
+`order_manager.get_order`/`get_latest_unpaid_order`. Full suite verified at
+93/93 (`python -m pytest . -v`) on Moeid's Windows venv across two live
+runs (the second confirming the read-retry and the two test-file fixes),
+no regressions. Branch `fix/issue-16-async-file-io`.
+
 ## Stock reversal on rejection (utils/inventory_manager.py, utils/order_manager.py) — fixed, was Issue #4
 **Previously:** `/reject` only flipped the order's status to `"rejected"`.
 The stock reserved by `decrement_stock_for_cart` at `place_order` time was
@@ -379,6 +588,12 @@ Covered by `test_stock_reversal.py`: restore after a single- and multi-item
 order, order-not-found, the deleted-variant skip path (both at the
 `inventory_manager` layer and the full `reject_order` handler), and the
 double-reject idempotency guarantee.
+
+**Update (Issue #16, Nov 2026):** `order_manager.get_order()` is now async
+and locked — see "Async file I/O" above. The two direct calls to it in this
+file's own test suite (`test_reject_order_handler_restores_stock`,
+`test_reject_order_handler_warns_on_skipped_variant`) now `await` it; no
+change to the production logic described above.
 
 ## Color matching (utils/inventory_manager.py) — fixed, was Issue 3.2
 **Previously:** `check_variant()`, `decrement_stock_for_cart()`, and
@@ -522,6 +737,14 @@ schema, no new locks, nothing on the `place_order`/`/reject` concurrency
 path touched. Verified live against the running bot in addition to the
 test suite.
 
+**Update (Issue #16, Nov 2026):** this test file's own `_seed_order()`
+helper reaches into `order_manager._load()`/`_save()` directly (there's no
+public API for directly overwriting an order's status/proof outside the
+real transitions) — both are now async (see "Async file I/O" above), so
+the helper now awaits them. No change to `_format_order_detail`/
+`_format_payment_status`/`_chunk_order_blocks` or the `pending_orders()`
+handler itself.
+
 ## The tool-calling loop (agent/agent.py)
 This is the most-edited file in the project. Key things to know before
 touching it:
@@ -657,6 +880,12 @@ touching it:
   pre-fix code (3/5 correctly failed there; the 2 that still passed were
   the untouched regression/failure-case checks). Full suite verified after
   merge (`pytest . -v`).
+- **Recovery `tool_call_id`s are unique per event — fixed, was Issue 2.1.**
+  See `docs/backlog-issues-2.1-3.4-4.1-4.2.md` for the full write-up;
+  `_new_recovery_tool_call_id()` (`uuid.uuid4().hex`) replaced the two
+  hardcoded literals (`"recovered_1"`, `"recovered_json_1"`) at both
+  recovery sites. Fixed and merged 2026-10-29. Covered by
+  `test/test_recovery_tool_call_ids.py`.
 - A handful of `# type: ignore` / `# pyright: ignore[...]` comments were
   added in `agent/agent.py` and `agent/tools.py` (Aug 2026, on `main`
   directly, unrelated to any numbered issue) purely to suppress static-type
@@ -664,6 +893,9 @@ touching it:
   dict-subscripting a value typed as possibly `None` after an `if error:`
   guard already ruled that out at runtime). No behavior change — these are
   editor/type-checker noise suppressions only.
+- `agent/tools.py::_submit_payment_reference` now `await`s
+  `order_manager.get_latest_unpaid_order` — see "Async file I/O" above
+  (Issue #16); no other change to this file.
 
 ## Prompt rules (agent/prompts.py)
 Every rule in this file exists because of a specific observed failure —
@@ -701,6 +933,18 @@ customer, **and now also restores stock** (see "Stock reversal on
 rejection" above). Both commands require admin authorization (see "Admin
 authorization" above) to invoke. `/pending_orders` shows full order detail
 per line item, not just a count (see "Pending orders detail" above).
+
+**Customers can now resubmit payment proof — fixed, was Issue 4.2.** See
+`docs/backlog-issues-2.1-3.4-4.1-4.2.md` for the full write-up (Option B:
+explicit `payment_proof_history` audit trail, not a silent overwrite).
+`order_manager.get_latest_unpaid_order()` now also matches `awaiting_review`
+orders (not just `pending_confirmation`), every submission is appended to
+`payment_proof_history`, and both `handle_payment_screenshot` and the admin
+notification in `user_handlers.py::_notify_admin` flag a resubmission with
+a ⚠️ RESUBMISSION notice. Fixed and merged 2026-10-29. Covered by
+`test/test_payment_resubmission.py`. `get_latest_unpaid_order` is also now
+async/locked as of Issue #16 — see "Async file I/O" above; this fix's own
+logic is otherwise unchanged by that.
 
 ## Known environment gotchas (all cost real debugging time — check these first)
 - **`ADMIN_GROUP_ID` stops working silently** if the group converts to a
@@ -751,6 +995,11 @@ per line item, not just a count (see "Pending orders detail" above).
   them into the feature branch. Always check `git status` (and `git diff`
   on anything unexpected) before staging, especially on a long-running local
   checkout where multiple things may have been edited between sessions.
+  **Issue #16 repeated this lesson in a different shape:** `git status`
+  after the fix showed `data/inventory.json` and `data/orders.json` as
+  modified from running the suite/manual testing during development — same
+  class of issue as the `data/*.json` gotcha below, caught the same way
+  (`git status` before staging, `git checkout -- data/...` to discard).
 - **`pytest test_*.py test/ -v` doesn't work in PowerShell.** PowerShell
   doesn't expand `*` globs before handing args to external commands the way
   bash does, so the glob is passed to pytest literally and it reports "file
@@ -768,7 +1017,8 @@ per line item, not just a count (see "Pending orders detail" above).
   guarantees the current directory is actually on `sys.path` the way the
   test files' manual `sys.path.insert` calls expect, regardless of how the
   `pytest` executable itself was resolved/invoked. Prefer `python -m pytest
-  . -v` over bare `pytest . -v` on Windows going forward.
+  . -v` over bare `pytest . -v` on Windows going forward. (This is also why
+  Issue #16's own live verification runs both used `python -m pytest . -v`.)
 - **pytest only discovers files actually named `test_*.py`.** A file saved
   as `testFoo.py` or `testFoo_bar.py` (missing the underscore right after
   `test`) runs fine with `python testFoo.py` if it has its own `main()`
@@ -802,6 +1052,23 @@ per line item, not just a count (see "Pending orders detail" above).
   obviously visible for the first time. Cleaned up via a dedicated commit
   (`Clear synthetic test orders from data/orders.json`, reset to `[]`)
   directly on `main`, separate from the Issue #5 code fix.
+- **A module-level `asyncio.Lock()` singleton can only ever be genuinely
+  contended once a real `await` sits inside its critical section — and
+  pytest-asyncio's one-event-loop-per-test-function default means that,
+  once it is, the SAME lock object can clash across tests with "is bound to
+  a different event loop."** First hit for `_checkout_lock` (Issue 3.1,
+  "Checkout atomicity" above); hit again for `_history_lock` the moment
+  Issue #16 added a genuine `asyncio.to_thread()` yield point inside
+  `conversation_manager`'s locked sections (see "Async file I/O" above).
+  Watch for this specifically whenever a fix adds a *real* await (a genuine
+  I/O call, not just another coroutine call that resolves synchronously)
+  inside an existing module-level lock's critical section — any
+  concurrency test for that lock that uses `asyncio.gather()` across
+  multiple tasks may need the same fix: take `monkeypatch` and reset the
+  lock to a fresh `asyncio.Lock()` instance at the top of the test. Purely
+  a test-isolation artifact (the real bot process has one long-lived event
+  loop for its entire lifetime), never a reason to change the production
+  locking design itself.
 
 ## Testing
 ```bash
@@ -838,6 +1105,13 @@ pytest . -v
   `pytest` and the standalone `python test_conversation_lock.py` runner.
   Independently re-run by Moeid on his own Windows venv (both forms
   passed) and verified manually against the live bot.
+  **Updated for Issue #16 (Nov 2026):** two of the seven tests
+  (`test_concurrent_appends_for_different_users_dont_interfere`,
+  `test_load_history_and_append_messages_interleaved_no_deadlock`) now take
+  `monkeypatch` and reset `_history_lock` to a fresh instance — see "Async
+  file I/O" above and the new "Known environment gotchas" entry on
+  module-level lock singletons. Re-verified at 7/7 (standalone runner, run
+  from this sandbox) and as part of the full 93/93 live suite.
 - `test_narration_guard.py` — unit tests the commitment-phrase detection logic
   used in `agent.py`'s narration guard, independent of a live model. Not
   pytest-discovered (no `test_`-prefixed functions, only `main()`) — run
@@ -851,7 +1125,9 @@ pytest . -v
   both the `inventory_manager` and `admin_handlers` layers, and the
   double-reject idempotency guarantee. Sandboxes `config` paths to
   `test_data/`, same pattern as `test/test_backend.py`, so it never touches
-  real `data/`.
+  real `data/`. **Updated for Issue #16 (Nov 2026):** two direct calls to
+  `order_manager.get_order(...)` (now async/locked) now `await` it — see
+  "Async file I/O" above.
 - `test/test_color_exact_match.py` — Issue 3.2 coverage: the
   exact-vs-substring color matching fix across `check_variant()`,
   `decrement_stock_for_cart()`, and `restore_stock_for_order()`. Sandboxes
@@ -940,7 +1216,10 @@ pytest . -v
   many orders). Sandboxes `config` paths to `test_data/`, same pattern as
   `test_stock_reversal.py`. 14/14 passed via both `pytest` and the standalone
   `python test_pending_orders_detail.py` runner; also verified live against
-  the running bot's real `/pending_orders` output.
+  the running bot's real `/pending_orders` output. **Updated for Issue #16
+  (Nov 2026):** the `_seed_order()` test helper now awaits
+  `order_manager._load()`/`_save()` (now async) — see "Async file I/O"
+  above.
 - `test_multi_item_checkout.py` — Issue #6 / bug-audit 1.1 coverage: the
   multi-item cart N-tuple stock decrement fix in `agent/tools.py::_place_order`.
   Drives the fix through the real `agent.tools.call_tool` public surface
@@ -983,6 +1262,41 @@ pytest . -v
   `python test\test_checkout_atomicity.py` runner. Independently re-run by
   Moeid on his own Windows venv (`python -m pytest . -v` → full suite
   67/67).
+- `test/test_recovery_tool_call_ids.py` — Issue 2.1 coverage: unique
+  recovery `tool_call_id`s. Fixed and merged 2026-10-29; see
+  `docs/backlog-issues-2.1-3.4-4.1-4.2.md` for the full write-up.
+- `test/test_payment_resubmission.py` — Issue 4.2 coverage: payment-proof
+  resubmission with `payment_proof_history` audit tracking. Fixed and
+  merged 2026-10-29; see `docs/backlog-issues-2.1-3.4-4.1-4.2.md` for the
+  full write-up. **Updated for Issue #16 (Nov 2026):** `order_manager.get_order`/
+  `get_latest_unpaid_order` are now async/locked — this file's calls to
+  them are updated to `await` accordingly (no logic change).
+- `test/test_async_file_io.py` — **new, Issue #16 / bug-audit 3.4 coverage**
+  (`utils/file_io.py`): the event loop stays responsive during a slow write
+  (the core bug this issue describes); a concurrent-readers-and-writers
+  stress test (the hazard atomic writes exist to close, and the one that
+  caught the Windows read-side `PermissionError` gap — see "Async file I/O"
+  above); atomic-write unit tests (no leftover temp files, full
+  replace-not-merge on overwrite, retry past a transient `PermissionError`,
+  raise-and-clean-up if retries are exhausted); and a missing-file-returns-
+  default regression check, both sync and async. 8/8 passed as part of the
+  full 93/93 live suite (`python -m pytest . -v`, Moeid's Windows venv) and
+  independently re-run via its standalone `python test_async_file_io.py`
+  runner in the sandbox used to develop the fix.
+- `test/test_inventory_read_retry.py` — **new, Issue #16 follow-up**
+  (`utils/inventory_manager.py::_load_if_changed`): covers the gap found
+  in post-merge review where this specific reader never actually used the
+  read-side retry `file_io.py` was built to provide — see the "Follow-up
+  fix" note under "Async file I/O" above. 7 tests: the core retry case at
+  the `_load_if_changed()` level and again through the public
+  `get_product_by_id`/`search_products`/`check_variant` call sites; a
+  retries-exhausted regression check (a genuinely broken file must still
+  raise, not be silently swallowed); and uncontended-read / mtime-reload
+  regression checks. Sandboxes `config.INVENTORY_FILE` to `test_data/`,
+  same pattern as the other isolated suites. Sanity-checked against the
+  pre-follow-up code — 4/7 correctly failed there. Expected to land as
+  part of `python -m pytest . -v` → 100/100 (93 existing + 7 new) once
+  applied alongside the `inventory_manager.py` fix.
 
 ## GitHub issue tracker status
 Bug tracking has moved from an informal `BUGS.md` to GitHub Issues on the
@@ -1028,13 +1342,35 @@ As of the last update:
   Moeid on his own Windows venv. Same underlying issue as bug-audit 3.1
   (see "Bug-audit fixes status" below) — this is the GitHub issue number
   for that fix. See "Checkout atomicity" above.
+- **Issue #12** (Substring Color Matching Causes Inventory Drift on
+  Rejection) — **fixed, closed.** Same underlying issue as bug-audit 3.2.
+  See "Color matching" above.
+- **Issue #13** (Hardcoded recovery `tool_call_id`s) — **fixed, closed**
+  (2026-10-29). Same underlying issue as bug-audit 2.1. See "The
+  tool-calling loop" above and `docs/backlog-issues-2.1-3.4-4.1-4.2.md`.
+- **Issue #16** (Synchronous file I/O blocks the event loop) — **fixed,
+  merged** to `main` (2026-11-06). Branch `fix/issue-16-async-file-io`.
+  Verified via `python -m pytest . -v` (93/93, full suite, no regressions,
+  across two live runs on Moeid's Windows venv) and the standalone
+  `test_async_file_io.py`/`test_conversation_lock.py` runners. Same
+  underlying issue as bug-audit 3.4 — this is the GitHub issue number for
+  that fix. See "Async file I/O" above and
+  `docs/backlog-issues-2.1-3.4-4.1-4.2.md`.
+  **Follow-up (Nov 2026, same issue, landed as a small patch after the
+  main merge):** `inventory_manager.py::_load_if_changed()` was found in
+  post-merge review to still be using a bare `open()` call instead of the
+  retry-protected `file_io.read_json_sync()` — see the "Follow-up fix"
+  note under "Async file I/O" above and
+  `test/test_inventory_read_retry.py`.
 
 ## Bug-audit fixes status (bug-audit-evaluation.md numbering)
 A separate audit round (Aug 2026) — an AI model given the repo + this doc,
 asked to find bugs, cross-checked in `bug-audit-evaluation.md` — used its
 own "Issue N.N" numbering (e.g. "1.2", "3.3") that is **unrelated** to the
 GitHub issue numbers above; don't conflate the two. None of these are filed
-as GitHub issues yet. Agreed priority order and current status:
+as GitHub issues yet, except where noted below (2.1, 3.2, 3.4 have since
+been filed and fixed as GitHub Issues #13, #12, and #16 respectively).
+Agreed priority order and current status:
 
 1. **Issue 1.2** (narration guard `return` instead of `continue`) —
    **fixed, merged** to `main` (Aug 2026), HIGHEST PRIORITY per the audit
@@ -1070,25 +1406,38 @@ as GitHub issues yet. Agreed priority order and current status:
    `test_checkout_atomicity.py` runner (5/5), both independently re-run by
    Moeid on his own Windows venv. See "Checkout atomicity" above.
 6. **Issue 3.2** (substring color matching can cause inventory drift on
-   rejection) — **fixed, merged** to `main` (Aug 2026). Already documented
-   above under "Stock reversal on rejection" as a known limitation before
-   this round — the audit rediscovered it rather than found something new,
-   but this fix closes it. Fixed with Approach A (exact case-insensitive
-   color matching, replacing substring containment, in all three match
-   sites in `inventory_manager.py`) — a schema change to record a
-   per-variant decrement breakdown (so restore could replay the exact
-   original split) was considered and rejected as touching the
-   order-placement write path and requiring a legacy-order fallback for
-   meaningfully more risk than the root cause required. Verified via
-   `pytest . -v` (77/77, full suite, no regressions), the standalone
-   `test/test_color_exact_match.py` runner (10/10), independently re-run by
-   Moeid on his own Windows venv. See "Color matching" above.
-7. Remaining backlog, lower priority: **2.1** (hardcoded recovery
-   `tool_call_id`s could collide across multiple recovery events in one
-   conversation), **3.4** (synchronous file I/O blocks the event loop),
-   **4.1** (narration guard's negative-phrase filter doesn't cover
-   "can't"/"unable to"), **4.2** (can't resubmit payment proof once an
-   order is `awaiting_review`).
+   rejection) — **fixed, merged** to `main` (Aug 2026), tracked as GitHub
+   Issue #12. Already documented above under "Stock reversal on rejection"
+   as a known limitation before this round — the audit rediscovered it
+   rather than found something new, but this fix closes it. Fixed with
+   Approach A (exact case-insensitive color matching, replacing substring
+   containment, in all three match sites in `inventory_manager.py`) — a
+   schema change to record a per-variant decrement breakdown (so restore
+   could replay the exact original split) was considered and rejected as
+   touching the order-placement write path and requiring a legacy-order
+   fallback for meaningfully more risk than the root cause required.
+   Verified via `pytest . -v` (77/77, full suite, no regressions), the
+   standalone `test/test_color_exact_match.py` runner (10/10), independently
+   re-run by Moeid on his own Windows venv. See "Color matching" above.
+7. **Issue 2.1** (hardcoded recovery `tool_call_id`s could collide across
+   multiple recovery events in one conversation) — **fixed, merged** to
+   `main` (2026-10-29), tracked as GitHub Issue #13. Unique IDs via
+   `_new_recovery_tool_call_id()` (`uuid.uuid4().hex`). See "The
+   tool-calling loop" above and `docs/backlog-issues-2.1-3.4-4.1-4.2.md`.
+8. **Issue 4.1** (narration guard's negative-phrase filter didn't cover
+   "can't"/"unable to") — **fixed, merged** to `main` (2026-10-29). See
+   `docs/backlog-issues-2.1-3.4-4.1-4.2.md` for the full write-up.
+9. **Issue 4.2** (can't resubmit payment proof once an order is
+   `awaiting_review`) — **fixed, merged** to `main` (2026-10-29), Option B
+   (explicit `payment_proof_history` audit trail). See "Payment flow" above
+   and `docs/backlog-issues-2.1-3.4-4.1-4.2.md`.
+10. **Issue 3.4** (synchronous file I/O blocks the event loop) — **fixed,
+    merged** to `main` (2026-11-06), tracked as GitHub Issue #16, with a
+    small follow-up patch (Nov 2026) for an unprotected reader
+    (`inventory_manager._load_if_changed`) found in post-merge review. See
+    "Async file I/O" above and `docs/backlog-issues-2.1-3.4-4.1-4.2.md`.
+
+**All ten items from the original bug-audit-evaluation.md are now closed.**
 
 ## Not built yet
 Rate limiting per user, fuzzy product search, product images, order status
@@ -1121,7 +1470,14 @@ of today's bugs).
   Issue 1.2 is the clearest example yet: the entire fix was a one-line
   `return reply, events` -> `continue` swap, with no refactor of the
   surrounding guard logic even though it would have been tempting to
-  "clean up" the narration-guard block while in there.
+  "clean up" the narration-guard block while in there. Issue #16 is a
+  partial exception worth noting: the scope genuinely grew beyond the
+  original backlog proposal (plain `asyncio.to_thread()`) once the atomic-
+  write requirement and the two read-side/lock-binding issues surfaced
+  through actual testing — but the *shape* of the fix stayed minimal
+  throughout (one new shared helper module, no changes to any manager's
+  locking design or public behavior beyond the two newly-async
+  `order_manager` reads that correctness required).
 - **Unrelated local changes get separated out, not bundled into a feature
   branch.** If `git status`/`git diff` on a feature branch shows edits
   unrelated to the issue being fixed (e.g. stray type-checker suppression
@@ -1130,12 +1486,12 @@ of today's bugs).
   separate commit. See the Issue #5 entry in "Known environment gotchas."
 - Verification command after significant changes:
   ```bash
-  python -c "from agent import tools, prompts, agent; from utils import order_manager, inventory_manager; from handlers import admin_handlers, user_handlers; print('all imports OK')"
+  python -c "from agent import tools, prompts, agent; from utils import order_manager, inventory_manager, file_io; from handlers import admin_handlers, user_handlers; print('all imports OK')"
   ```
 - **Git branching/merge workflow for issue fixes** (established during the
-  Issue #4 fix, repeated for Issues #3, #5, and — under the separate
-  bug-audit "1.N" numbering, see "Bug-audit fixes status" above — 1.2 and
-  1.3, expected to repeat for future issues):
+  Issue #4 fix, repeated for Issues #3, #5, #10, #16, and — under the
+  separate bug-audit "1.N" numbering, see "Bug-audit fixes status" above —
+  1.2, 1.3, 2.1, 3.2, 4.1, and 4.2):
   1. `git checkout -b fix/issue-N-short-description` off `main` — never
      commit directly to `main`.
   2. Implement the fix, add tests, run the full suite (`pytest . -v`).
@@ -1154,7 +1510,18 @@ of today's bugs).
      also confirmed live). If the bot isn't live at fix time (as for Issue
      #3 originally), rely on sandboxed/mocked tests instead and note the gap
      — don't fabricate or assume a live-verification result that didn't
-     happen.
+     happen. **Issue #16 is the clearest case yet of this step earning its
+     keep at the unit-test level, not just the live-bot level:** the first
+     `python -m pytest . -v` run against the real Windows venv caught a
+     genuine Windows-only read-side race, a missed `await` in
+     `test_stock_reversal.py`, and a lock-binding artifact in
+     `test_conversation_lock.py` — none of which were visible from
+     sandboxed review/testing alone (no real filesystem contention, no
+     Windows-specific `PermissionError` semantics, and no genuinely
+     interleaved `asyncio.gather()` since the sandbox's own smoke tests
+     didn't reproduce the exact pytest-asyncio per-test-loop conditions).
+     Always run the real suite on the real target OS before calling a fix
+     done, even when a sandboxed review/test pass already looked clean.
   5. Generate a `.patch` file for review: `git diff main...fix/issue-N-...
      > issue-N.patch`. Verify it applies cleanly to a fresh checkout of
      `main` (`git apply --check`) before handing it over.
@@ -1178,7 +1545,11 @@ of today's bugs).
      gotchas" above) — `git checkout -- data/` to discard them if so. If
      stale/test data is discovered in real `data/*.json` (as happened with
      Issue #5), clean it up as its own separate, clearly-labeled commit —
-     don't fold a data cleanup into a code-fix commit.
+     don't fold a data cleanup into a code-fix commit. **Issue #16 hit this
+     same check** — `data/inventory.json`/`data/orders.json` showed as
+     modified from suite/manual-testing runs during development, discarded
+     with `git checkout -- data/inventory.json data/orders.json` before
+     staging the actual fix.
   10. `git push origin main`, then delete the merged local branch
       (`git branch -d fix/issue-N-...`) and the remote branch if it was ever
       pushed (`git push origin --delete fix/issue-N-...` — harmless "remote

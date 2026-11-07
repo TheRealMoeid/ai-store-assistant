@@ -2,7 +2,7 @@
 
 Source: `bug-audit-evaluation.md` / `original-audit-report.md`, cross-checked against the current repository state. These are the four items still open after Issues 1.2, 1.3, 1.1, 3.3, 3.1, and 3.2 were fixed and merged. All four are classified **low priority** by the original audit — none are silent-failure or data-corruption bugs like the ones already fixed; they're either narrow edge cases, minor UX gaps, or scale-related concerns that don't bite at the project's current single-seller size.
 
-> **Status update (2026-10-29):** Issues **2.1, 4.1, and 4.2 are fixed and merged** into `main`. Only **Issue 3.4** (synchronous file I/O) remains open. The sections below are preserved for history; each fixed issue is marked with its resolution.
+> **Status update (2026-11-06):** All four items are now fixed and merged into `main`. Issues **2.1, 4.1, and 4.2** landed 2026-10-29; **Issue 3.4** (tracked as GitHub Issue #16) landed 2026-11-06. The sections below are preserved for history; each fixed issue is marked with its resolution.
 
 ---
 
@@ -52,32 +52,42 @@ Apply this at both recovery sites (native-tag and leaked-JSON), replacing `"reco
 
 ## Issue 3.4 — Synchronous file I/O blocks the event loop
 
+> **✅ FIXED (2026-11-06), tracked as GitHub Issue #16.** Implemented as Option A from this doc (`asyncio.to_thread()`, no new dependency), extended with an atomic-write layer that Option A's original text didn't call out but that turned out to be required for correctness — see "What changed from the original proposal" below. Covered by `test/test_async_file_io.py` plus `await`-only updates to the call sites and tests that used the two `order_manager` reads this fix made async. Full suite verified at 93/93 (`python -m pytest . -v`) on Moeid's Windows venv, no regressions. **Follow-up (Nov 2026):** post-merge review found `inventory_manager.py::_load_if_changed()` — the exact reader the read-side retry below was written for — had never actually been wired up to use it (still a bare `open()` call). Fixed as a small separate patch; see `docs/CLAUDE.md`'s "Async file I/O" section and `test/test_inventory_read_retry.py` for the full write-up.
+
 **Location:** All of `utils/cart_manager.py`, `utils/order_manager.py`, `utils/conversation_manager.py`, and `utils/inventory_manager.py`.
 
-**Current code:** Every read/write path in these modules uses plain blocking calls inside `async def` functions, e.g.:
+**Original code:** Every read/write path in these modules used plain blocking calls inside `async def` functions, e.g.:
 ```python
 def _save(carts: dict[str, list[dict]]):
     with open(config.CARTS_FILE, "w", encoding="utf-8") as f:
         json.dump(carts, f, ensure_ascii=False, indent=2)
 ```
-This is called from inside `async def set_cart(...)` while holding `_carts_lock` — the disk write itself is synchronous.
+This was called from inside `async def set_cart(...)` while holding `_carts_lock` — the disk write itself was synchronous.
 
 **Root cause:** Python's `asyncio` event loop is single-threaded; when a coroutine calls a blocking function like `open()`/`json.dump()`, control does not return to the event loop until that call completes. Every other coroutine scheduled on the loop — other users' Telegram updates, other in-flight tool calls — has to wait.
 
-**Why it matters:** In `aiogram`'s polling model, all incoming Telegram updates and the bot's own outgoing calls (typing indicators, message sends) run on the same event loop as the business logic. A slow disk write (or a moment of disk contention) during, say, `order_manager.place_order()` would stall Telegram's polling loop for every other concurrent user for the duration of that write, not just the user placing the order. At the file sizes and write frequency this project has today, individual writes are fast enough (milliseconds) that this is unlikely to be user-noticeable, but it doesn't scale gracefully if inventory/orders/conversation files grow substantially, or if the underlying storage is ever slower (e.g. a networked or throttled disk in a hosted environment).
+**Why it mattered:** In `aiogram`'s polling model, all incoming Telegram updates and the bot's own outgoing calls (typing indicators, message sends) run on the same event loop as the business logic. A slow disk write (or a moment of disk contention) during, say, `order_manager.place_order()` would stall Telegram's polling loop for every other concurrent user for the duration of that write, not just the user placing the order. At the file sizes and write frequency this project had, individual writes were fast enough (milliseconds) that this was unlikely to be user-noticeable, but it didn't scale gracefully — see "Severity" below for why this stayed low-priority until now.
 
-**Severity:** Low at current scale. Explicitly judged "acceptable" in `CLAUDE.md` given the project's small-scale, single-seller, JSON-file-by-design architecture. This is a scalability/robustness concern, not a correctness bug — nothing is lost or corrupted, requests just queue up.
+**Severity (at the time this was filed):** Low at current scale. Explicitly judged "acceptable" in `CLAUDE.md` given the project's small-scale, single-seller, JSON-file-by-design architecture. A scalability/robustness concern, not a correctness bug — nothing was lost or corrupted, requests just queued up.
 
-**Proposed fix (per the original audit, Option A — no new dependency):** Wrap each blocking file operation in `asyncio.to_thread()`, which runs it in a background thread pool and lets the event loop continue servicing other coroutines while the write/read completes:
+**What changed from the original proposal.** This doc's original text (quoted below for history) assumed a plain `asyncio.to_thread()` wrap was sufficient and explicitly said "nothing is lost or corrupted" under that design. That held only because every read and write ran on the single event-loop thread before this fix — a read could never physically overlap a write. Once writes move to a worker thread, that stops being true for any file with an *unlocked* reader: `inventory_manager`'s `get_product_by_id`/`search_products`/`check_variant` (built on `_load_if_changed`) are deliberately synchronous and unlocked (see that module's own docstring), and `order_manager.get_order`/`get_latest_unpaid_order` were plain synchronous unlocked reads before this fix. A naive `to_thread()` wrap of the writes alone would have let those unlocked reads observe a half-written (torn) file mid-write — a new hazard this fix introduces by moving work off the loop thread, not one Option A's original text accounted for. Implementation therefore added one piece beyond the original proposal:
+
+- **`utils/file_io.py` (new):** `read_json`/`write_json_atomic` (async, offload to `asyncio.to_thread`) and their `_sync` counterparts. Writes go to a temp file in the same directory, then `os.replace()` into place — any reader sees either the fully-old or fully-new file, never a torn one. `order_manager.get_order` and `get_latest_unpaid_order` were additionally converted to locked, async functions (mirroring `get_all_orders`, which was already both), since they're the only unlocked readers outside `inventory_manager` that needed closing this way.
+
+A second, Windows-specific refinement was needed after an initial live `pytest . -v` run: even with the write atomic, a concurrent `open(path, "r")` could transiently raise `PermissionError` while another thread's `os.replace()` was in flight (observed directly: 3 failures out of 80 concurrent operations in the new stress test, `test/test_async_file_io.py::test_concurrent_readers_and_writers_never_see_a_torn_file`, on a Windows venv). This is a sharing-violation window, not data corruption — the atomic write was never actually torn — so the fix was a short, bounded retry on the read side, mirroring the retry the write side already had around `os.replace()`. Confirmed resolved on a second live run (93/93).
+
+A live test run after the initial patch also surfaced two issues unrelated to `file_io.py` itself, both now fixed: `test/test_stock_reversal.py` had two direct (unawaited) calls to the newly-async `order_manager.get_order()` that were missed during the initial patch — a straightforward oversight, fixed by adding `await`. Separately, `test/test_conversation_lock.py`'s two genuinely-concurrent tests (driving real `asyncio.gather()` contention on `_history_lock`) started failing with "is bound to a different event loop" — not a regression, but the *first* time `_history_lock` was ever genuinely contended across concurrent tasks: before this fix, the locked sections were pure sync code with no real `await` inside, so `asyncio.Lock`'s fast uncontended path never yielded and never bound itself to a loop. Post-fix, `asyncio.to_thread()` inside the lock is a real yield point, so concurrency became real for the first time — which tripped the exact pytest-asyncio cross-test event-loop-binding artifact already documented and worked around for `_checkout_lock` in `test/test_checkout_atomicity.py` (Issue 3.1 / GitHub #10). Fixed the same way: the two affected tests take `monkeypatch` and reset `_history_lock` to a fresh instance at the start of the test.
+
+**Original proposed fix (Option A — no new dependency), preserved for history:**
 ```python
 async def _save(carts: dict[str, list[dict]]):
     await asyncio.to_thread(_save_sync, carts)
 ```
-This would need to be threaded through the sync/async split each manager already has (the project already separates "sync core" helpers from "locked async wrapper" functions for `conversation_manager.py`, so the pattern is established — this would extend that same shape to actual thread offloading, not just lock management).
+This needed to be threaded through the sync/async split each manager already had (the project already separates "sync core" helpers from "locked async wrapper" functions for `conversation_manager.py`, so the pattern was established — this extended that same shape to actual thread offloading, not just lock management). As noted above, implementation also required the atomic-write layer and the two read-side fixes this section describes, which the original proposal didn't anticipate.
 
-An alternative (rejected by the original audit) is adopting `aiofiles` for native async file I/O — cleaner code, but adds a new dependency for a benefit the project doesn't currently need.
+An alternative (rejected by the original audit, and still not adopted) was `aiofiles` for native async file I/O — cleaner code, but adds a new dependency for a benefit the project doesn't currently need; `utils/file_io.py` covers the same need with `asyncio.to_thread()` and the stdlib.
 
-**Effort / risk:** Medium. Touches every manager module across the codebase (cart, order, conversation, inventory), so it's a wider-reaching change than the other three backlog items even though each individual edit is mechanical. Because every one of these modules already holds an `asyncio.Lock` around its critical section, care would be needed to make sure `asyncio.to_thread()` calls happen *inside* the lock (to preserve the existing mutual-exclusion guarantees) rather than accidentally letting two threads race on the same file. Would need the full test suite re-run afterward given the breadth of files touched, even though no single change is complex.
+**Effort / risk (actual):** Medium-to-high — broader than the original "Medium" estimate, since it touched every manager module (as expected) plus `agent/tools.py` and `handlers/user_handlers.py` (await sites for the two newly-async `order_manager` reads) plus four existing test files, and surfaced two real issues only visible under a live `pytest . -v` run rather than at review time (the missed `await` in `test_stock_reversal.py`, and the `_history_lock` cross-test binding artifact in `test_conversation_lock.py`). Full suite verified at 93/93 after both rounds of fixes, no regressions.
 
 ---
 
@@ -176,8 +186,8 @@ Keep the status filter narrow, but add a small history/log of proof submissions 
 | Issue | Area | Severity | Effort | Touches | Status |
 |---|---|---|---|---|---|
 | 2.1 | Recovery `tool_call_id`s | Medium (rare trigger) | Very low | `agent/agent.py` only | ✅ Fixed (2026-10-29) |
-| 3.4 | Sync file I/O | Low (current scale) | Medium (broad but mechanical) | All 4 `utils/*_manager.py` files | ⏳ **Open — last remaining item** |
+| 3.4 | Sync file I/O | Low (current scale) | Medium → actually Medium-high (atomic writes + two read-side fixes required) | All 4 `utils/*_manager.py` files, new `utils/file_io.py`, `agent/tools.py`, `handlers/user_handlers.py`, 4 existing test files, 1 new test file | ✅ Fixed (2026-11-06, GitHub Issue #16) |
 | 4.1 | Narration guard negative-phrase gap | Low | Very low | `agent/agent.py` only | ✅ Fixed (2026-10-29) |
 | 4.2 | Can't resubmit payment proof | Low-to-moderate UX | Low (Option A) / Medium (Option B) | `utils/order_manager.py`, `handlers/user_handlers.py` | ✅ Fixed (2026-10-29, Option B) |
 
-**Suggested next step:** only Issue 3.4 remains. Given its breadth, do it as its own dedicated branch with the full regression suite run afterward.
+**All four backlog items are now closed.** See `docs/CLAUDE.md`'s "Stock integrity" / "The tool-calling loop" / "Payment flow" sections for 2.1/4.1/4.2, and its new "Async file I/O" section for 3.4 / Issue #16.

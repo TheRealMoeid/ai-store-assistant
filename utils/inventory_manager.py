@@ -29,12 +29,32 @@ synchronous. Two reasons:
      fully-new file, never a torn one — the one hazard offloading would
      have otherwise introduced is already closed by the atomic write
      itself, so there's no correctness reason to also make the read async.
-_cache is still only ever mutated from the event-loop thread: the writers
-do their file_io.write_json_atomic() await (which runs on a worker thread),
-then invalidate _cache["mtime"] back on the loop thread afterward, same as
-before this fix — no cross-thread cache mutation was introduced.
+_cache itself is never actually racy: every mutation (both here in
+_load_if_changed and the post-write invalidation in the two writers below)
+happens on the event-loop thread, and there's no `await` between a write
+completing and `_cache["mtime"] = None` running — Python's single-threaded
+coroutine execution means those two statements can never interleave with
+another coroutine's code. No lock was ever needed around the dict itself.
+
+The real hazard closed by this fix is one level down, in the actual file
+read: _load_if_changed's open()/json.load() now goes through
+file_io.read_json_sync() instead of a bare open() call, so it gets the
+same bounded PermissionError retry as every other reader in this project
+(see file_io.py's module docstring — this function, called from many
+places throughout agent/tools.py, IS the reader that retry exists for:
+it's unlocked, called constantly, and can genuinely land mid-os.replace()
+while decrement_stock_for_cart/restore_stock_for_order are writing on a
+worker thread). Before this, routing the retry logic only into file_io.py
+without ever calling it from here left this exact reader unprotected —
+an unhandled PermissionError here propagates up through get_product_by_id/
+search_products/check_variant into agent/tools.py, where call_tool()'s
+broad except Exception catches it and returns a spurious "tool failed:
+[Errno 13] ..." to the customer for what should have been an ordinary
+read. Not a crash, but a reliability regression Issue #16 was supposed to
+close under concurrent load, not reintroduce. The mtime check itself
+(config.INVENTORY_FILE.stat().st_mtime) is unchanged — only the inner file
+read is now retry-protected.
 """
-import json
 import logging
 import asyncio
 import config
@@ -48,8 +68,7 @@ _inventory_lock = asyncio.Lock()
 def _load_if_changed():
     mtime = config.INVENTORY_FILE.stat().st_mtime
     if mtime != _cache["mtime"]:
-        with open(config.INVENTORY_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = file_io.read_json_sync(config.INVENTORY_FILE, {"products": []})
         _cache["products"] = data.get("products", [])
         _cache["mtime"] = mtime
     return _cache["products"]
