@@ -1,18 +1,26 @@
 """
 Orders and feedback are append-only JSON logs (no DB, per project requirements).
-Each write reads the whole file, appends, and writes back — fine at this scale.
+Each write reads the whole file, appends, and writes back -- fine at this scale.
 Admin group notification happens one layer up (agent.py has the bot instance).
 
 Order status lifecycle:
-  pending_confirmation -> awaiting_review (payment proof submitted) -> confirmed | rejected
+  pending_confirmation -> awaiting_review (payment proof submitted) -> confirmed -> shipped -> delivered
+                                                                     -> rejected (terminal)
+
+shipped/delivered are an optional tail onto the already-hardened
+pending_confirmation/awaiting_review/confirmed/rejected lifecycle --
+every existing transition (place_order, attach_payment_proof,
+set_order_status_if_not for /reject) is completely unchanged. See
+advance_order_status() below for the new forward-only transition guard
+that shipped/delivered uses.
 
 Issue #16 (bug-audit 3.4): all file I/O now goes through
 utils.file_io.read_json/write_json_atomic (asyncio.to_thread offload +
 atomic temp-file/os.replace writes), so disk access never blocks the event
 loop and a read can never observe a half-written file.
 
-As part of this fix, get_order() and get_latest_unpaid_order() — previously
-plain synchronous functions doing their own unlocked file read — are now
+As part of this fix, get_order() and get_latest_unpaid_order() -- previously
+plain synchronous functions doing their own unlocked file read -- are now
 async and acquire _orders_lock like every other read/write in this module.
 This wasn't optional: once writes to ORDERS_FILE run in a worker thread
 (instead of on the single event-loop thread, where a read could never
@@ -32,6 +40,19 @@ from utils import file_io
 # Locks to prevent concurrent read-modify-write races
 _orders_lock = asyncio.Lock()
 _feedback_lock = asyncio.Lock()
+
+# Order status, beyond confirmed/rejected (shipped/delivered): forward-only
+# transitions, each keyed by the status it advances TO -> the status it
+# requires the order to currently be in. advance_order_status() uses this
+# so a seller can't skip a step (confirmed straight to delivered) or act on
+# an order that isn't ready yet (shipping something still awaiting
+# payment). rejected is intentionally absent here -- it's a separate,
+# terminal transition handled by set_order_status_if_not(), not part of
+# this forward chain.
+_REQUIRED_PREDECESSOR = {
+    "shipped": "confirmed",
+    "delivered": "shipped",
+}
 
 
 async def _load(path) -> list[dict]:
@@ -69,9 +90,9 @@ async def place_order(user_id: int, username: str, items: list[dict]) -> dict:
 
 async def get_order(order_id: str) -> dict | None:
     """
-    Now async + locked (Issue #16) — was a plain synchronous unlocked read.
+    Now async + locked (Issue #16) -- was a plain synchronous unlocked read.
     Callers: agent/tools.py, utils/inventory_manager.py (restore_stock_for_order),
-    handlers/admin_handlers.py — all already async, all updated to await this.
+    handlers/admin_handlers.py -- all already async, all updated to await this.
     """
     async with _orders_lock:
         records = await _load(config.ORDERS_FILE)
@@ -96,6 +117,21 @@ async def get_latest_unpaid_order(user_id: int) -> dict | None:
             o for o in records
             if o["user_id"] == user_id and o["status"] in ("pending_confirmation", "awaiting_review")
         ]
+        return matches[-1] if matches else None
+
+
+async def get_latest_order_for_user(user_id: int) -> dict | None:
+    """
+    Returns the customer's single most recent order, regardless of status --
+    unlike get_latest_unpaid_order(), which only matches orders still
+    awaiting payment. Added alongside the shipped/delivered status tail so
+    a customer can ask "where's my order?" (agent/tools.py's
+    check_order_status) even after it's already confirmed, shipped, or
+    delivered, not just while payment is still pending.
+    """
+    async with _orders_lock:
+        records = await _load(config.ORDERS_FILE)
+        matches = [o for o in records if o["user_id"] == user_id]
         return matches[-1] if matches else None
 
 
@@ -134,7 +170,7 @@ async def set_order_status(order_id: str, status: str) -> dict | None:
 async def set_order_status_if_not(order_id: str, status: str, forbidden_current_status: str) -> tuple[dict | None, bool]:
     """
     Atomically transitions order_id to `status`, unless its current status
-    already equals `forbidden_current_status` — in which case it's left
+    already equals `forbidden_current_status` -- in which case it's left
     untouched. Returns (order, transitioned):
       - order is None if no order with that id exists.
       - transitioned is True only if this call actually changed the status.
@@ -156,6 +192,48 @@ async def set_order_status_if_not(order_id: str, status: str, forbidden_current_
                 await _save(config.ORDERS_FILE, records)
                 return o, True
         return None, False
+
+
+async def advance_order_status(order_id: str, new_status: str) -> tuple[dict | None, str | None]:
+    """
+    Atomically transitions order_id FORWARD to new_status, but only if the
+    order's CURRENT status is exactly the required predecessor for that
+    step (see _REQUIRED_PREDECESSOR: confirmed -> shipped -> delivered).
+    Used for the /ship and /deliver admin commands.
+
+    Mirrors set_order_status_if_not()'s atomic check-and-set shape and
+    _orders_lock usage, but the check is inverted: set_order_status_if_not
+    refuses a FORBIDDEN current status (used for idempotent /reject);
+    this refuses anything OTHER than the one REQUIRED predecessor, since
+    shipped/delivered must advance exactly one step at a time -- no
+    skipping (confirmed straight to delivered), no shipping an order
+    that isn't confirmed yet, and no double-shipping an order that's
+    already shipped (a second /ship on an already-shipped order sees its
+    current status as "shipped", not "confirmed", and is refused the same
+    way a double /reject already is -- a clear message, not a silent
+    no-op or a duplicate customer DM).
+
+    Returns (order, error):
+      - order is None only if no order with that id exists at all.
+      - error is None on success. On a refused transition, order is the
+        order as it currently stands (so the caller can report its real
+        status) and error is a short, human-readable reason -- e.g.
+        "order is currently 'pending_confirmation', not 'confirmed'".
+    """
+    required = _REQUIRED_PREDECESSOR.get(new_status)
+    if required is None:
+        return None, f"'{new_status}' is not a valid order-status advancement"
+
+    async with _orders_lock:
+        records = await _load(config.ORDERS_FILE)
+        for o in records:
+            if o["order_id"] == order_id:
+                if o["status"] != required:
+                    return o, f"order is currently '{o['status']}', not '{required}'"
+                o["status"] = new_status
+                await _save(config.ORDERS_FILE, records)
+                return o, None
+        return None, None
 
 
 async def get_all_orders() -> list[dict]:

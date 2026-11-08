@@ -37,8 +37,10 @@ class AdminOnlyMiddleware(BaseMiddleware):
     """
     Gates every handler registered on this router. Applied once here rather
     than repeated per-handler, so a new admin command added later is safe
-    by default instead of needing someone to remember the check.
-    Unauthorized attempts are logged and silently dropped — no response is
+    by default instead of needing someone to remember the check. /ship and
+    /deliver below get this gating for free, the same way /pending_orders,
+    /confirm, and /reject already do.
+    Unauthorized attempts are logged and silently dropped -- no response is
     sent, so we don't confirm to a random user that admin commands exist.
     """
 
@@ -55,7 +57,7 @@ class AdminOnlyMiddleware(BaseMiddleware):
                 event.chat.id,
                 event.text,
             )
-            return  # silently ignore — don't leak that admin commands exist
+            return  # silently ignore -- don't leak that admin commands exist
         return await handler(event, data)
 
 
@@ -74,10 +76,16 @@ def _format_created_at(created_at: str | None) -> str:
 
 def _format_payment_status(order: dict) -> str:
     """
-    Human-readable payment state, distinguishing "no proof yet" from
-    "proof submitted, waiting on the seller" and surfacing what kind of
+    Human-readable payment/fulfillment state, distinguishing "no proof yet"
+    from "proof submitted, waiting on the seller" and surfacing what kind of
     proof (screenshot vs typed reference) was submitted, since /confirm and
-    /reject decisions hinge on this.
+    /reject decisions hinge on this. shipped/delivered (the new order-status
+    tail) get their own explicit labels too, so a seller scanning
+    /pending_orders can tell at a glance how far an order has progressed --
+    `confirmed`/`rejected` deliberately keep falling through to the bare
+    status string below, unchanged from before this fix, since they were
+    already working and this fix's scope is additive, not a reformat of the
+    whole function.
     """
     status = order.get("status")
     proof = order.get("payment_proof")
@@ -90,6 +98,10 @@ def _format_payment_status(order: dict) -> str:
         if proof:
             return f'📎 Payment reference submitted ("{proof}") — awaiting review'
         return "📎 Payment proof submitted — awaiting review"
+    if status == "shipped":
+        return "📦 Shipped"
+    if status == "delivered":
+        return "✅ Delivered"
     return status or "unknown status"
 
 
@@ -100,7 +112,7 @@ def _format_order_detail(order: dict) -> str:
     rather than a bare count), and an estimated total from current
     inventory prices. Previously /pending_orders only showed an item
     *count*, forcing the seller to open orders.json by hand to see what was
-    actually ordered — see Issue #5.
+    actually ordered -- see Issue #5.
     """
     lines = [
         f"🧾 {order.get('order_id')} — {_format_payment_status(order)}",
@@ -122,7 +134,7 @@ def _format_order_detail(order: dict) -> str:
         if not product:
             # Product may have been deleted/renamed since the order was
             # placed (same edge case restore_stock_for_order already
-            # handles) — fall back to the raw id instead of failing.
+            # handles) -- fall back to the raw id instead of failing.
             total_known = False
             lines.append(f"  • {item.get('product_id')} (no longer in inventory) — {size}/{color} × {qty}")
             continue
@@ -246,4 +258,63 @@ async def reject_order(message: Message, command: CommandObject, bot: Bot):
     await bot.send_message(
         order["user_id"],
         f"Your order {order_id} couldn't be confirmed — please contact us if you believe this is a mistake.",
+    )
+
+
+@router.message(Command("ship"))
+async def ship_order(message: Message, command: CommandObject, bot: Bot):
+    """
+    Marks a confirmed order as shipped. Uses advance_order_status's
+    forward-only transition guard, so this is refused (not silently
+    ignored) if the order isn't currently 'confirmed' -- e.g. it's still
+    awaiting payment, or it's already been shipped once (double /ship is a
+    clear rejection, not a duplicate customer DM, mirroring /reject's own
+    idempotency handling for the double-tap case).
+    """
+    if not command.args:
+        await message.answer("Usage: /ship <order_id>")
+        return
+
+    order_id = command.args.strip()
+    order, error = await order_manager.advance_order_status(order_id, "shipped")
+    if order is None:
+        await message.answer(f"No order found with id {order_id}")
+        return
+
+    if error:
+        await message.answer(f"Can't mark {order_id} as shipped — {error}.")
+        return
+
+    await message.answer(f"📦 {order_id} marked as shipped.")
+    await bot.send_message(
+        order["user_id"],
+        f"📦 Your order {order_id} has shipped! We'll let you know once it's delivered.",
+    )
+
+
+@router.message(Command("deliver"))
+async def deliver_order(message: Message, command: CommandObject, bot: Bot):
+    """
+    Marks a shipped order as delivered. Same forward-only transition guard
+    as /ship above -- refused with a clear reason if the order hasn't been
+    shipped yet, or has already been marked delivered.
+    """
+    if not command.args:
+        await message.answer("Usage: /deliver <order_id>")
+        return
+
+    order_id = command.args.strip()
+    order, error = await order_manager.advance_order_status(order_id, "delivered")
+    if order is None:
+        await message.answer(f"No order found with id {order_id}")
+        return
+
+    if error:
+        await message.answer(f"Can't mark {order_id} as delivered — {error}.")
+        return
+
+    await message.answer(f"✅ {order_id} marked as delivered.")
+    await bot.send_message(
+        order["user_id"],
+        f"✅ Your order {order_id} has been delivered. Enjoy, and thanks for shopping with us!",
     )
