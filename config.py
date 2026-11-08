@@ -45,6 +45,15 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 # --- Conversation memory ---
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "20"))
 
+# --- Add to config.py, near MAX_HISTORY_MESSAGES under "# --- Conversation memory ---" ---
+
+# --- Rate limiting ---
+# Per-user sliding-window limit on inbound text messages, to bound how many
+# LLM calls (and therefore Groq token spend / Ollama CPU time) a single user
+# can trigger in a short window. See utils/rate_limiter.py.
+RATE_LIMIT_MESSAGES = int(os.getenv("RATE_LIMIT_MESSAGES", "10"))
+RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
+
 # Make sure the data folders exist on first run
 DATA_DIR.mkdir(exist_ok=True)
 CONVERSATIONS_DIR.mkdir(exist_ok=True)
