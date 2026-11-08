@@ -5,7 +5,7 @@ plus the Python implementations behind them.
 Carts are persisted to disk via utils/cart_manager.py so they survive restarts.
 Orders and feedback are persisted via utils/order_manager.py.
 
-user_id / username are never taken from the model's arguments — they're
+user_id / username are never taken from the model's arguments -- they're
 injected by dispatch() from the real Telegram context, so the model can't
 spoof who's ordering.
 """
@@ -17,7 +17,7 @@ from utils import inventory_manager, order_manager, cart_manager
 # sequence in _place_order across ALL users. Without this, two near-simultaneous
 # checkout requests for the same user (double-tap, client retry, etc.) can both
 # read the same cart before either clears it, both pass validation, and each
-# independently decrement stock and create its own order — a duplicate order
+# independently decrement stock and create its own order -- a duplicate order
 # for what the customer intended as a single checkout. See Issue #10 / bug-audit
 # 3.1.
 #
@@ -26,7 +26,7 @@ from utils import inventory_manager, order_manager, cart_manager
 # this project's own "minimal, structurally-scoped fixes" principle favors a
 # proven single-lock-per-concern pattern over new architectural surface like a
 # per-user dict of locks, especially since checkouts are rare, high-value
-# events for a small-scale, single-seller bot — the cross-user contention from
+# events for a small-scale, single-seller bot -- the cross-user contention from
 # serializing all checkouts globally is negligible in practice, and it avoids
 # introducing any lock-ordering coupling between cart_manager, inventory_manager,
 # and order_manager (the lock lives here in the orchestration layer, not inside
@@ -35,7 +35,7 @@ from utils import inventory_manager, order_manager, cart_manager
 #
 # Deliberately does NOT clear the cart until every step has succeeded (unlike
 # an "atomically consume the cart up front, then restore it if something later
-# fails" design) — clearing early would open a window where a concurrent
+# fails" design) -- clearing early would open a window where a concurrent
 # add_to_cart could write a new item into the (already-cleared) cart, only for
 # a subsequent failure-path restore to silently overwrite and lose it. Holding
 # this lock for the whole sequence and only clearing the cart as the last step
@@ -68,7 +68,7 @@ TOOL_SCHEMAS = [
                 "properties": {
                     "product_id": {
                         "type": "string",
-                        "description": "The exact 'id' field from search_products results, e.g. 'p001'. Never the product name — call search_products first if you don't have the id.",
+                        "description": "The exact 'id' field from search_products results, e.g. 'p001'. Never the product name -- call search_products first if you don't have the id.",
                     }
                 },
                 "required": ["product_id"],
@@ -159,13 +159,29 @@ TOOL_SCHEMAS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_order_status",
+            "description": "Look up the status of the customer's own order (e.g. awaiting payment, confirmed, shipped, delivered, rejected). Use this whenever the customer asks about their order, where it is, tracking, or delivery status -- never guess or invent a status.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "order_id": {
+                        "type": "string",
+                        "description": "Optional. The specific order id to check, if the customer gave one (e.g. 'ord_...'). Leave empty to look up their most recent order.",
+                    },
+                },
+            },
+        },
+    },
 ]
 
 def _resolve_product_id(raw_id: str) -> tuple[dict | None, dict | None]:
     """
     Looks up a product by id. If that fails, tries treating raw_id as a
     name/keyword instead (models sometimes pass the product name). Returns
-    (product, error) — exactly one of which is non-None.
+    (product, error) -- exactly one of which is non-None.
     """
     product = inventory_manager.get_product_by_id(raw_id)
     if product:
@@ -243,7 +259,7 @@ async def _add_to_cart(args: dict, ctx: dict) -> dict:
     # Load the cart from disk
     cart = await cart_manager.get_cart(ctx["user_id"])
 
-    # If this exact line item is already in the cart, don't add it again —
+    # If this exact line item is already in the cart, don't add it again --
     # bump quantity instead.
     for item in cart:
         if (item["product_id"], item["size"], item["color"]) == (product["id"], args["size"], args["color"]): # type: ignore
@@ -263,7 +279,7 @@ async def _add_to_cart(args: dict, ctx: dict) -> dict:
             await cart_manager.set_cart(ctx["user_id"], cart)
             return {
                 "status": "already_in_cart",
-                "hint": f"This item was already in the cart — quantity increased to {item['quantity']}.",
+                "hint": f"This item was already in the cart -- quantity increased to {item['quantity']}.",
                 "cart": cart,
             }
 
@@ -297,7 +313,7 @@ async def _place_order(args: dict, ctx: dict) -> dict:
         if not cart:
             return {
                 "error": "cart is empty",
-                "hint": "You haven't actually called add_to_cart yet — do that first with the item(s) the customer wants, then call place_order again.",
+                "hint": "You haven't actually called add_to_cart yet -- do that first with the item(s) the customer wants, then call place_order again.",
             }
 
         # Re-validate every line against *current* stock before touching anything.
@@ -329,7 +345,7 @@ async def _place_order(args: dict, ctx: dict) -> dict:
 
         # Atomically validate and decrement stock for the entire cart at once.
         # decrement_stock_for_cart already iterates every line item internally,
-        # so it must be called exactly once per checkout — previously this was
+        # so it must be called exactly once per checkout -- previously this was
         # wrapped in `for item in cart:`, which re-ran the full-cart decrement
         # once per line item (N times for an N-item cart), over-decrementing
         # stock by a multiple of what was actually ordered. See Issue #6.
@@ -344,7 +360,7 @@ async def _place_order(args: dict, ctx: dict) -> dict:
         order = await order_manager.place_order(ctx["user_id"], ctx["username"], cart)
 
         # Clear the cart on disk only now that everything else has actually
-        # succeeded — the cart is never mutated on a failure path, so there's
+        # succeeded -- the cart is never mutated on a failure path, so there's
         # nothing to restore and no window where a concurrent add_to_cart's
         # write could be silently lost.
         await cart_manager.set_cart(ctx["user_id"], [])
@@ -353,7 +369,7 @@ async def _place_order(args: dict, ctx: dict) -> dict:
 
 async def _submit_payment_reference(args: dict, ctx: dict) -> dict:
     # order_manager.get_latest_unpaid_order is now async + locked (Issue #16)
-    # — was a plain synchronous unlocked read.
+    # -- was a plain synchronous unlocked read.
     order = await order_manager.get_latest_unpaid_order(ctx["user_id"])
     if not order:
         return {"error": "no order awaiting payment for this customer"}
@@ -364,6 +380,40 @@ async def _log_feedback(args: dict, ctx: dict) -> dict:
     entry = await order_manager.log_feedback(ctx["user_id"], ctx["username"], args["kind"], args["message"])
     return {"status": "logged", "feedback": entry}
 
+async def _check_order_status(args: dict, ctx: dict) -> dict:
+    """
+    Looks up either a specific order (by id) or the customer's most recent
+    order overall (any status, not just unpaid ones -- see
+    order_manager.get_latest_order_for_user).
+
+    Security: if the model supplies an order_id, we still verify it
+    actually belongs to THIS user_id before returning anything. order_id is
+    model-supplied input, not something we can trust was typed correctly or
+    honestly -- without this check, a hallucinated or guessed order_id
+    could leak another customer's order (items, status) across accounts.
+    Matches this project's existing "never trust the LLM for context"
+    convention (user_id/username are injected, never parsed from model
+    arguments) applied to a second case: an id the model passes AS an
+    argument still can't be trusted to scope access on its own.
+    """
+    order_id = (args.get("order_id") or "").strip()
+
+    if order_id:
+        order = await order_manager.get_order(order_id)
+        if not order or order.get("user_id") != ctx["user_id"]:
+            return {"error": "no order found with that id for this customer"}
+    else:
+        order = await order_manager.get_latest_order_for_user(ctx["user_id"])
+        if not order:
+            return {"error": "this customer has no orders yet"}
+
+    return {
+        "order_id": order["order_id"],
+        "status": order["status"],
+        "items": order["items"],
+        "created_at": order.get("created_at"),
+    }
+
 _DISPATCH = {
     "search_products": _search_products,
     "get_product_details": _get_product_details,
@@ -373,6 +423,7 @@ _DISPATCH = {
     "place_order": _place_order,
     "submit_payment_reference": _submit_payment_reference,
     "log_feedback": _log_feedback,
+    "check_order_status": _check_order_status,
 }
 
 async def call_tool(name: str, args: dict, user_id: int, username: str) -> dict:
