@@ -1070,6 +1070,132 @@ logic is otherwise unchanged by that.
   loop for its entire lifetime), never a reason to change the production
   locking design itself.
 
+  ## Known environment gotchas (continued) — SOCKS proxy / httpx2 / national bandwidth throttling (Nov 2026)
+
+**Symptom:** `python bot.py` crashed immediately on the first inbound
+message with:
+```
+ImportError: Using SOCKS proxy, but the 'socksio' package is not installed.
+```
+raised from inside `agent/llm_client.py::get_client()` when constructing
+the `AsyncOpenAI` client — well before `_checkout_lock`, rate limiting, or
+any of this project's own code ran.
+
+**Root cause, layer 1 — the SOCKS proxy itself.** Moeid's dev machine runs
+a VPN client that exposes a local SOCKS5 proxy
+(`socks5://127.0.0.1:10808`) and sets `HTTP_PROXY`/`HTTPS_PROXY` system-wide
+to point at it — needed because `api.telegram.org` is unreachable from his
+location without it (see the existing "If Telegram (app or web) doesn't
+load without a VPN..." gotcha above, which predates this one). `httpx`
+(the transport the OpenAI SDK uses) trusts those env vars by default
+(`trust_env=True`), so even the local Ollama call
+(`http://localhost:11434`) — which never needs a proxy — got routed
+through the SOCKS proxy. `httpx`'s SOCKS support needs the separate
+`socksio` package, which wasn't installed, hence the crash.
+
+**Root cause, layer 2 — a second, unexplained `httpx2` package.**
+Tracebacks and later request logs showed the actual failing/succeeding
+module as `httpx2` (e.g. `File "...venv\Lib\site-packages\httpx2\_client.py"`,
+`INFO:httpx2:HTTP Request: ...`), not plain `httpx` — a separate installed
+package (version 2.10.0 at the time, with its own `httpcore2`,
+`truststore`, etc.) that was somehow the one actually being imported and
+used, despite nothing in this project's own code referencing it.
+**Root cause not fully identified** — most likely either a transitive
+dependency of `openai`/`aiogram` pulling in a differently-named fork/alias,
+or a leftover from an earlier `pip install` in this venv. Flagged here
+rather than resolved, since the fix below (explicit `trust_env=False` on
+the client this project constructs) sidesteps the question without
+needing to answer it: regardless of which package ends up handling the
+request, an explicit `httpx.AsyncClient(trust_env=False)` passed into
+`AsyncOpenAI(http_client=...)` is what's actually imported and used (later
+logs correctly showed `INFO:httpx:` instead of `INFO:httpx2:` once this
+was in place), confirming the fix took effect at the right layer. If
+`httpx2` resurfaces in a future `pip install -r requirements.txt` on a
+fresh venv, it's worth a `pip show httpx2` / dependency-tree check
+(`pip install pipdeptree && pipdeptree -p httpx2`) to actually trace it,
+since this investigation never got to a definitive answer.
+
+**Also hit, unrelated to the proxy itself but blocking every `pip install`
+attempt along the way:** the venv's own `pip.exe`/`python.exe` launcher
+executables had a stale, broken absolute path baked in
+(`C:\Users\VAHABI\Desktop\...\store_bot\venv\Scripts\python.exe`) from
+when the venv was originally created at a different location before the
+project moved to `D:\Me\Projects\Telegram Store Bot\store_bot`. Every
+`pip ...` invocation failed with `Fatal error in launcher: Unable to
+create process using ...`. **Fix: use `python -m pip ...` instead of the
+bare `pip`/`pip.exe` launcher** — this calls pip through the already-active
+interpreter rather than through the broken launcher shim, and worked
+immediately. (If `python -m pip` also fails the same way, the venv itself
+is unrecoverably tied to the old path and needs recreating — see the
+general advice already given above for `venv`/`.venv` issues in "Setup and
+Installation.") Worth remembering any time this venv is moved, copied, or
+restored from a backup to a different path.
+
+**Fix for the proxy/SOCKS issue — explicit `trust_env=False`, not
+installing `socksio`.** Installing `socksio` (once `python -m pip`
+unblocked installs) and setting `NO_PROXY=localhost,127.0.0.1` were both
+tried first and **neither fixed the underlying latency problem** — `httpx`/
+`httpx2`'s proxy auto-detection apparently didn't respect `NO_PROXY` the
+way plain `requests`-style tooling does, or built its client before
+`NO_PROXY` was consulted. The fix that actually worked: `agent/llm_client.py`
+now constructs both the Groq and Ollama `AsyncOpenAI` clients with an
+explicit `http_client=httpx.AsyncClient(trust_env=False)`, so neither
+client ever looks at `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY` —
+connections always go straight to the configured `base_url`
+(`api.groq.com` or `localhost:11434`) with zero proxy involvement,
+regardless of what's set in the shell the bot is launched from. This
+matches `bot.py`'s own existing convention for Telegram (an explicit,
+opt-in `PROXY_URL`, never ambient env-var detection) — if a future LLM
+provider genuinely needs a proxy to reach, pass it explicitly via
+`httpx.AsyncClient(proxy=...)` in that provider's own branch, rather than
+re-enabling `trust_env`.
+
+**The real remaining cause of slow turns: national internet throttling,
+not a bug.** After the `trust_env=False` fix, Ollama's own latency
+(confirmed via direct, bot-bypassing timing: `ollama run qwen3:8b "say
+hi"` ≈ 10s; the same call through `agent/llm_client.py`'s real code path
+with the full `SYSTEM_PROMPT` + `TOOL_SCHEMAS` ≈ 25s) was no longer the
+dominant cost — but full bot turns were still taking 30-120+ seconds,
+inconsistently. Direct testing of the Telegram leg alone
+(`bot.get_me()`) intermittently failed outright with
+`ClientConnectorDNSError` (DNS couldn't resolve `api.telegram.org`) on one
+run and `ConnectionRefusedError`/"remote computer refused the network
+connection" on another, both while the VPN showed as "connected." This
+traces to the VPN connection itself being degraded, not flaky
+configuration: Moeid's country throttled international/VPN-routed
+bandwidth nationwide around this time (see
+https://radar.cloudflare.com/traffic/ir for the traffic pattern). Every
+Telegram API call (`send_chat_action`, `message.answer`, and implicitly
+aiogram's own long-polling `getUpdates`) depends on that same degraded
+VPN path, so this adds real, unpredictable, sometimes very large latency
+to every single turn — on top of, not instead of, the LLM call itself.
+**This is an infrastructure/network constraint outside the application's
+control**, not something further code changes can fix.
+
+**Mitigation shipped for this: a periodic typing-indicator refresh.**
+Telegram's "typing..." indicator expires client-side after ~5 seconds — a
+single `send_chat_action()` call at the top of a turn (the previous
+behavior) goes stale and silently disappears partway through any turn
+that takes longer than that, which is now routine rather than exceptional
+given the network conditions above. `handlers/user_handlers.py::handle_message`
+now runs a background task (`_keep_typing`) that re-sends the typing
+action every `_TYPING_REFRESH_SECONDS` (4s) for the full duration of the
+`run_agent()` call, cancelled in a `finally` block so it never outlives
+the real reply — whether `run_agent` returns normally or raises. A
+failure inside a single typing-refresh send (e.g. a transient Telegram
+API hiccup, itself more likely under the current network conditions) is
+caught and logged rather than allowed to crash the user-facing turn — the
+customer's actual reply must never be lost because a cosmetic "still
+typing" pulse failed to send.
+
+Both fixes (`trust_env=False` and the typing-indicator refresh) are
+unconditionally correct improvements and worth keeping even after/if the
+national bandwidth throttling eases — the first removes a genuinely
+unnecessary proxy hop for local traffic, and the second makes any
+longer-than-5-second turn (slow model, multi-round tool call, network
+hiccup, or just a big order) show honest "still working" feedback instead
+of going silently dead.
+
 ## Testing
 ```bash
 pytest . -v
@@ -1446,6 +1572,36 @@ integration, LangGraph or similar orchestration (deliberately not adopted —
 current failures have all been model-reliability issues, not
 orchestration-complexity issues, so a framework wouldn't have prevented any
 of today's bugs).
+
+**Prioritized order for tackling the above** (decided 2026-11-08, Moeid):
+1. **Rate limiting per user** — highest priority. Unlike the rest of this
+   list, this is an active reliability/cost risk today, not just a missing
+   feature: `agent/agent.py` currently lets any single user burn unlimited
+   LLM calls, and Groq's free tier caps at 100,000 tokens/day (see "LLM
+   provider" above) — one chatty or malicious user can exhaust the whole
+   shop's daily quota and lock out every other customer. Needs a decision
+   on where the limiter lives (`agent/tools.py` vs `agent/agent.py` vs a
+   new `utils/rate_limiter.py`), per-user vs. global budget, and failure
+   mode (friendly message vs. silent drop).
+2. **Order status beyond confirmed/rejected** (e.g. shipped/delivered) —
+   extends the already-hardened order lifecycle (`pending_confirmation` ->
+   `awaiting_review` -> `confirmed`/`rejected`) that Issues #4, #10, 3.1,
+   3.2, and 4.2 made atomic and correct. Real operational gap for a live
+   store (sellers can't tell a customer "shipped" today), and reuses
+   existing `order_manager`/admin-command machinery rather than new infra.
+3. **Fuzzy product search** — `search_products` is currently plain
+   substring match (documented "by design" limitation, see "By Design" in
+   the README). Real UX papercut, but the LLM's `_resolve_product_id`
+   fallback already compensates reasonably well, so lower urgency than 1-2.
+4. **Product images** — presentational only, no correctness/reliability
+   payoff. Would need a schema change (`image_url` field on products),
+   which this project's conventions treat as higher-risk (see the Issue #5
+   price-snapshot-deferral precedent above).
+5. **Real payment gateway integration** — biggest scope and risk (money
+   changes hands), and explicitly "by design" deferred — the project
+   intentionally relies on manual screenshot/reference review for a
+   single-seller shop. Arguably out of scope unless the business scales
+   past manual review; last on the list, possibly indefinitely.
 
 ## Working conventions
 - **Whole-file replacement over diff-patching.** Patches (`git am`, inline
