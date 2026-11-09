@@ -57,3 +57,15 @@ RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
 # Make sure the data folders exist on first run
 DATA_DIR.mkdir(exist_ok=True)
 CONVERSATIONS_DIR.mkdir(exist_ok=True)
+
+# --- Add to config.py, near the other feature constants ---
+
+# --- Fuzzy search ---
+# Threshold (0.0-1.0) a query word must score against a product's text
+# (via difflib.SequenceMatcher) to count as a fuzzy match. Only consulted
+# when the plain substring search in inventory_manager.search_products()
+# finds zero results for a non-empty query. Higher = stricter (fewer,
+# closer typo matches); lower = looser (catches more typos, but risks
+# matching unrelated products). See utils/inventory_manager.py's
+# _fuzzy_search() docstring for the matching strategy.
+FUZZY_SEARCH_THRESHOLD = float(os.getenv("FUZZY_SEARCH_THRESHOLD", "0.7"))
