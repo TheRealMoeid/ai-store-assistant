@@ -43,7 +43,8 @@
           "material": "leather/suede",
           "stock": 97
         }
-      ]
+      ],
+      "image": "AgACAgQAAyEFAAMBAhO3_AADCGrzgyTnQR-Xyy6NCnLyujFQbVZUAALJEGsb8V6ZU-ZCJjzydJk4AQADAgADeQADPQQ"
     },
     {
       "id": "p002",
@@ -76,7 +77,12 @@
           "material": "cotton fleece",
           "stock": 6
         }
-      ]
+      ],
+      "image": "AgACAgQAAyEFAAMBAhO3_AADEmr0hd_X1UWVtNZoVK22WxRiaXjoAALNDmsb8V6hU_Fe-v2BEFomAQADAgADeQADPQQ",
+      "images_by_color": {
+        "cream": "AgACAgQAAyEFAAMBAhO3_AADDmr0hOwtDK-QYRxix9T9UiUbaHi2AALKDmsb8V6hUyaQPjsoTMGiAQADAgADeQADPQQ",
+        "black": "AgACAgQAAyEFAAMBAhO3_AADEGr0hQIAAZmlKdkXF3HyWzN3hg8zEAACyw5rG_FeoVNDG1IjwHUtcQEAAwIAA3kAAz0E"
+      }
     }
   ]
 }

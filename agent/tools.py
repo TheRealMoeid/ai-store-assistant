@@ -14,33 +14,10 @@ import asyncio
 from utils import inventory_manager, order_manager, cart_manager
 
 # Serializes the entire read -> validate -> decrement -> create-order -> clear
-# sequence in _place_order across ALL users. Without this, two near-simultaneous
-# checkout requests for the same user (double-tap, client retry, etc.) can both
-# read the same cart before either clears it, both pass validation, and each
-# independently decrement stock and create its own order -- a duplicate order
-# for what the customer intended as a single checkout. See Issue #10 / bug-audit
-# 3.1.
-#
-# A single global lock (not per-user) is used deliberately, matching the
-# precedent set for utils/conversation_manager.py's _history_lock (Issue 3.3):
-# this project's own "minimal, structurally-scoped fixes" principle favors a
-# proven single-lock-per-concern pattern over new architectural surface like a
-# per-user dict of locks, especially since checkouts are rare, high-value
-# events for a small-scale, single-seller bot -- the cross-user contention from
-# serializing all checkouts globally is negligible in practice, and it avoids
-# introducing any lock-ordering coupling between cart_manager, inventory_manager,
-# and order_manager (the lock lives here in the orchestration layer, not inside
-# any of those modules, so their own internal locks are still acquired and
-# released independently and sequentially, exactly as before).
-#
-# Deliberately does NOT clear the cart until every step has succeeded (unlike
-# an "atomically consume the cart up front, then restore it if something later
-# fails" design) -- clearing early would open a window where a concurrent
-# add_to_cart could write a new item into the (already-cleared) cart, only for
-# a subsequent failure-path restore to silently overwrite and lose it. Holding
-# this lock for the whole sequence and only clearing the cart as the last step
-# avoids that data-loss class entirely, at the cost of no other compensating
-# logic being needed.
+# sequence in _place_order across ALL users. See the full docstring history
+# in CLAUDE.md ("Checkout atomicity", Issue #10 / bug-audit 3.1) for why
+# this is a single global lock held for the whole sequence, with the cart
+# cleared only on success.
 _checkout_lock = asyncio.Lock()
 
 TOOL_SCHEMAS = [
@@ -62,14 +39,18 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "get_product_details",
-            "description": "Get full details (description, price, all variants) for one specific product by its id.",
+            "description": "Get full details (description, price, all variants) for one specific product by its id. If the customer wants to see a specific color's photo, pass it as `color` -- otherwise the product's general photo (if any) is used.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "product_id": {
                         "type": "string",
                         "description": "The exact 'id' field from search_products results, e.g. 'p001'. Never the product name -- call search_products first if you don't have the id.",
-                    }
+                    },
+                    "color": {
+                        "type": "string",
+                        "description": "Optional. A specific color the customer wants to see a photo of (must be one of the product's real colors). Leave empty for the product's general photo.",
+                    },
                 },
                 "required": ["product_id"],
             },
@@ -182,6 +163,14 @@ def _resolve_product_id(raw_id: str) -> tuple[dict | None, dict | None]:
     Looks up a product by id. If that fails, tries treating raw_id as a
     name/keyword instead (models sometimes pass the product name). Returns
     (product, error) -- exactly one of which is non-None.
+
+    NOTE: the product dict this returns, when resolved via the
+    search_products fallback below, is a search-result shallow copy with
+    raw image data already stripped (see inventory_manager._strip_raw_image)
+    -- callers that need the real `image`/`images_by_color` fields (i.e.
+    _get_product_details) must re-fetch by id via get_product_by_id rather
+    than trust this return value directly. _get_product_details does this;
+    see its own comment for why.
     """
     product = inventory_manager.get_product_by_id(raw_id)
     if product:
@@ -216,7 +205,38 @@ async def _search_products(args: dict, ctx: dict) -> dict:
 
 async def _get_product_details(args: dict, ctx: dict) -> dict:
     product, error = _resolve_product_id(args.get("product_id", ""))
-    return product if product else error # type: ignore
+    if error:
+        return error
+
+    # _resolve_product_id may have resolved via the search_products
+    # fallback path, whose results have `image`/`images_by_color` already
+    # stripped (they're search-listing shallow copies, not the raw stored
+    # product -- see inventory_manager._strip_raw_image). Re-fetching by
+    # the now-known real id guarantees we're resolving a photo against the
+    # genuine stored data regardless of which path got us here -- without
+    # this, a product found via the name-fallback path would always look
+    # imageless even when it has real photos on file.
+    raw_product = inventory_manager.get_product_by_id(product["id"]) # pyright: ignore[reportOptionalSubscript]
+    if not raw_product:
+        return product  # shouldn't happen (resolved a moment ago), but don't crash if it does
+
+    requested_color = (args.get("color") or "").strip()
+    image, resolved_color = inventory_manager.get_image_for_color(raw_product, requested_color or None)
+
+    result = {k: v for k, v in raw_product.items() if k != "images_by_color"}
+    if image:
+        result["image"] = image
+        if resolved_color:
+            result["image_color"] = resolved_color
+        # image present but no image_color: the customer gets the
+        # product's GENERAL photo, not necessarily the exact color they
+        # may have asked for -- agent/prompts.py tells the model to be
+        # honest about that distinction rather than imply a color match
+        # that didn't happen.
+    else:
+        result.pop("image", None)
+
+    return result
 
 async def _check_availability(args: dict, ctx: dict) -> dict:
     product, error = _resolve_product_id(args.get("product_id", ""))
@@ -256,11 +276,8 @@ async def _add_to_cart(args: dict, ctx: dict) -> dict:
             ),
         }
 
-    # Load the cart from disk
     cart = await cart_manager.get_cart(ctx["user_id"])
 
-    # If this exact line item is already in the cart, don't add it again --
-    # bump quantity instead.
     for item in cart:
         if (item["product_id"], item["size"], item["color"]) == (product["id"], args["size"], args["color"]): # type: ignore
             combined_qty = item["quantity"] + requested_qty
@@ -275,7 +292,6 @@ async def _add_to_cart(args: dict, ctx: dict) -> dict:
                     ),
                 }
             item["quantity"] = combined_qty
-            # Save the updated cart back to disk
             await cart_manager.set_cart(ctx["user_id"], cart)
             return {
                 "status": "already_in_cart",
@@ -291,24 +307,15 @@ async def _add_to_cart(args: dict, ctx: dict) -> dict:
             "quantity": requested_qty,
         }
     )
-    # Save the new cart state to disk
     await cart_manager.set_cart(ctx["user_id"], cart)
     return {"status": "added", "cart": cart}
 
 async def _view_cart(args: dict, ctx: dict) -> dict:
-    # Load the cart from disk
     cart = await cart_manager.get_cart(ctx["user_id"])
     return {"cart": cart}
 
 async def _place_order(args: dict, ctx: dict) -> dict:
-    # Serializes the whole checkout sequence (read cart -> validate -> decrement
-    # stock -> create order -> clear cart) across all users. See the
-    # _checkout_lock docstring above for why this is a single global lock held
-    # for the full duration rather than an "atomically consume the cart, restore
-    # on failure" design. Fixes Issue #10 / bug-audit 3.1 (duplicate orders from
-    # near-simultaneous checkout requests for the same user).
     async with _checkout_lock:
-        # Load the cart from disk
         cart = await cart_manager.get_cart(ctx["user_id"])
         if not cart:
             return {
@@ -316,7 +323,6 @@ async def _place_order(args: dict, ctx: dict) -> dict:
                 "hint": "You haven't actually called add_to_cart yet -- do that first with the item(s) the customer wants, then call place_order again.",
             }
 
-        # Re-validate every line against *current* stock before touching anything.
         shortfalls = []
         for item in cart:
             variants = inventory_manager.check_variant(item["product_id"], item["size"], item["color"])
@@ -343,12 +349,6 @@ async def _place_order(args: dict, ctx: dict) -> dict:
                 "shortfalls": shortfalls,
             }
 
-        # Atomically validate and decrement stock for the entire cart at once.
-        # decrement_stock_for_cart already iterates every line item internally,
-        # so it must be called exactly once per checkout -- previously this was
-        # wrapped in `for item in cart:`, which re-ran the full-cart decrement
-        # once per line item (N times for an N-item cart), over-decrementing
-        # stock by a multiple of what was actually ordered. See Issue #6.
         result = await inventory_manager.decrement_stock_for_cart(cart)
         if result.get("error"):
             return {
@@ -358,18 +358,11 @@ async def _place_order(args: dict, ctx: dict) -> dict:
             }
 
         order = await order_manager.place_order(ctx["user_id"], ctx["username"], cart)
-
-        # Clear the cart on disk only now that everything else has actually
-        # succeeded -- the cart is never mutated on a failure path, so there's
-        # nothing to restore and no window where a concurrent add_to_cart's
-        # write could be silently lost.
         await cart_manager.set_cart(ctx["user_id"], [])
 
         return {"status": "order_placed", "order": order}
 
 async def _submit_payment_reference(args: dict, ctx: dict) -> dict:
-    # order_manager.get_latest_unpaid_order is now async + locked (Issue #16)
-    # -- was a plain synchronous unlocked read.
     order = await order_manager.get_latest_unpaid_order(ctx["user_id"])
     if not order:
         return {"error": "no order awaiting payment for this customer"}
@@ -383,18 +376,9 @@ async def _log_feedback(args: dict, ctx: dict) -> dict:
 async def _check_order_status(args: dict, ctx: dict) -> dict:
     """
     Looks up either a specific order (by id) or the customer's most recent
-    order overall (any status, not just unpaid ones -- see
-    order_manager.get_latest_order_for_user).
-
-    Security: if the model supplies an order_id, we still verify it
-    actually belongs to THIS user_id before returning anything. order_id is
-    model-supplied input, not something we can trust was typed correctly or
-    honestly -- without this check, a hallucinated or guessed order_id
-    could leak another customer's order (items, status) across accounts.
-    Matches this project's existing "never trust the LLM for context"
-    convention (user_id/username are injected, never parsed from model
-    arguments) applied to a second case: an id the model passes AS an
-    argument still can't be trusted to scope access on its own.
+    order overall. Security: an order_id supplied by the model is still
+    verified to belong to THIS user_id before anything is returned -- see
+    full reasoning in this function's earlier version (Issue: order status).
     """
     order_id = (args.get("order_id") or "").strip()
 
@@ -432,7 +416,6 @@ async def call_tool(name: str, args: dict, user_id: int, username: str) -> dict:
     if not fn:
         return {"error": f"unknown tool '{name}'"}
     try:
-        # We await here because some tools (like place_order) are now async
         return await fn(args, ctx)
     except KeyError as e:
         return {"error": f"missing required argument: {e}"}
