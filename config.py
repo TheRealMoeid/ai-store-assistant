@@ -69,3 +69,12 @@ CONVERSATIONS_DIR.mkdir(exist_ok=True)
 # matching unrelated products). See utils/inventory_manager.py's
 # _fuzzy_search() docstring for the matching strategy.
 FUZZY_SEARCH_THRESHOLD = float(os.getenv("FUZZY_SEARCH_THRESHOLD", "0.7"))
+
+# --- Add to config.py, near ADMIN_GROUP_ID ---
+
+# --- Product images ---
+# chat_id of the private channel used as a seller-facing image-upload
+# gallery (the bot must be an ADMIN of this channel to receive its posts).
+# Must be a negative number, same shape as ADMIN_GROUP_ID. See
+# handlers/channel_images.py.
+PRODUCT_IMAGES_CHANNEL_ID = int(os.getenv("PRODUCT_IMAGES_CHANNEL_ID", "0"))
