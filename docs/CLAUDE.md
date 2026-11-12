@@ -1424,6 +1424,39 @@ pytest . -v
   part of `python -m pytest . -v` → 100/100 (93 existing + 7 new) once
   applied alongside the `inventory_manager.py` fix.
 
+- `test/test_rate_limiter.py` — rate limiting per user coverage: limit
+  enforcement, rejected calls not counting further against the user,
+  sliding-window aging (full and partial), per-user isolation, and
+  concurrency safety (50 simultaneous calls for one user never overshoot
+  the limit). 7/7 passed as part of the full 107/107 suite.
+- `test/test_order_status.py` — order status (shipped/delivered)
+  coverage: the `advance_order_status` transition guard (happy path, every
+  invalid-transition case, double-advance refusal, order-not-found),
+  `get_latest_order_for_user`, `/ship`/`/deliver` end-to-end, the new
+  status display labels, and `check_order_status` (own order, latest
+  order, the cross-user ownership block, no orders, unknown id). 20/20
+  passed as part of the full 130/130 suite.
+- `test/test_fuzzy_search.py` — fuzzy product search coverage: exact-match
+  priority and regression, core typo cases (substitution, missing letter,
+  transposition), threshold precision (unrelated words correctly
+  excluded), category-filter interaction, result ranking, and
+  punctuation-stripping. 16/16 passed as part of the full 146/146 suite.
+- `test/test_product_images.py` — product images coverage (default +
+  per-color): caption parsing for both formats, default vs. color-specific
+  storage and validation against real variant colors, `get_image_for_color`'s
+  resolution/fallback logic, `has_image` without leaking raw image data,
+  the channel handler end-to-end (success, invalid color, wrong channel,
+  media-group ignore, missing caption), `get_product_details`'s color
+  resolution including the name-fallback re-fetch regression test, the
+  customer-facing send's color-aware caption, and full `run_agent`
+  integration confirming the `product_image` event carries the resolved
+  color end to end. ~35/~35 passed as part of the full 181/181 suite.
+
+All four were also manually verified against the live bot (not just the
+sandboxed suite) before being considered done, per this project's own
+"Git branching/merge workflow for issue fixes" convention (step 4: manual
+live verification, not just unit tests).
+
 ## GitHub issue tracker status
 Bug tracking has moved from an informal `BUGS.md` to GitHub Issues on the
 repo. **Note:** the GitHub issue/PR *numbers* don't line up with the
@@ -1566,42 +1599,216 @@ Agreed priority order and current status:
 **All ten items from the original bug-audit-evaluation.md are now closed.**
 
 ## Not built yet
-Rate limiting per user, fuzzy product search, product images, order status
-beyond confirmed/rejected (e.g. shipped/delivered), any real payment gateway
-integration, LangGraph or similar orchestration (deliberately not adopted —
-current failures have all been model-reliability issues, not
-orchestration-complexity issues, so a framework wouldn't have prevented any
-of today's bugs).
+Real payment gateway integration. All other items from the original "Not
+built yet" list -- rate limiting per user, order status beyond
+confirmed/rejected, fuzzy product search, and product images -- have
+since been built; see their own sections above for each.
 
-**Prioritized order for tackling the above** (decided 2026-11-08, Moeid):
-1. **Rate limiting per user** — highest priority. Unlike the rest of this
-   list, this is an active reliability/cost risk today, not just a missing
-   feature: `agent/agent.py` currently lets any single user burn unlimited
-   LLM calls, and Groq's free tier caps at 100,000 tokens/day (see "LLM
-   provider" above) — one chatty or malicious user can exhaust the whole
-   shop's daily quota and lock out every other customer. Needs a decision
-   on where the limiter lives (`agent/tools.py` vs `agent/agent.py` vs a
-   new `utils/rate_limiter.py`), per-user vs. global budget, and failure
-   mode (friendly message vs. silent drop).
-2. **Order status beyond confirmed/rejected** (e.g. shipped/delivered) —
-   extends the already-hardened order lifecycle (`pending_confirmation` ->
-   `awaiting_review` -> `confirmed`/`rejected`) that Issues #4, #10, 3.1,
-   3.2, and 4.2 made atomic and correct. Real operational gap for a live
-   store (sellers can't tell a customer "shipped" today), and reuses
-   existing `order_manager`/admin-command machinery rather than new infra.
-3. **Fuzzy product search** — `search_products` is currently plain
-   substring match (documented "by design" limitation, see "By Design" in
-   the README). Real UX papercut, but the LLM's `_resolve_product_id`
-   fallback already compensates reasonably well, so lower urgency than 1-2.
-4. **Product images** — presentational only, no correctness/reliability
-   payoff. Would need a schema change (`image_url` field on products),
-   which this project's conventions treat as higher-risk (see the Issue #5
-   price-snapshot-deferral precedent above).
-5. **Real payment gateway integration** — biggest scope and risk (money
-   changes hands), and explicitly "by design" deferred — the project
-   intentionally relies on manual screenshot/reference review for a
-   single-seller shop. Arguably out of scope unless the business scales
-   past manual review; last on the list, possibly indefinitely.
+**Real payment gateway integration was explicitly decided out of scope
+for now (2026-11-11, Moeid).** The project intentionally relies on manual
+screenshot/reference review for a single-seller shop, and a real gateway
+integration would be the biggest-scope, highest-risk item on the original
+list by a wide margin -- real money changing hands, PCI-adjacent
+concerns, webhook signature verification and replay protection, and a
+genuine architectural departure from this project's "no backend beyond
+flat JSON files, manual review" design philosophy that every other fix in
+this project has deliberately preserved. Worth revisiting only if the
+business scales past what manual review can reasonably handle -- not
+something to build pre-emptively.
+
+---
+
+## Rate limiting per user (utils/rate_limiter.py) — built, was "Not built yet" item 1
+Per-user sliding-window rate limiter on inbound text messages, closing a
+real reliability/cost risk: `agent/agent.py` previously let any single
+user trigger unlimited LLM calls, and Groq's free tier caps at 100,000
+tokens/day (see "LLM provider" above) -- one chatty or malicious user
+could exhaust the whole shop's daily quota and lock out every other
+customer.
+
+- `utils/rate_limiter.py`: in-memory, per-user sliding-window log (a
+  `deque` of allowed-message timestamps per `user_id`), guarded by a
+  single `asyncio.Lock` -- same single-lock-per-concern pattern as
+  `_carts_lock`/`_orders_lock`/`_history_lock`/`_inventory_lock`/
+  `_checkout_lock` elsewhere in this project, chosen for the same
+  "minimal, structurally-scoped" reasons documented for those. Deliberately
+  **not persisted to disk** -- losing counters on a restart just resets
+  everyone's quota, which is harmless, and it avoids a fifth JSON file and
+  a fifth async/atomic-write surface for state that doesn't need either.
+- Configurable via `config.RATE_LIMIT_MESSAGES` /
+  `config.RATE_LIMIT_WINDOW_SECONDS` (`.env`-overridable; default 10
+  messages per 60 seconds) -- generous enough for a multi-item checkout,
+  tight enough to stop one user from burning the whole day's quota.
+- Checked in `handlers/user_handlers.py::handle_message` **before** any
+  LLM call is made, so a throttled user's message never spends
+  agent/LLM budget at all -- a rejected check doesn't itself count against
+  the user, so a throttled user's window clears out naturally as old
+  timestamps age past the window.
+- A related, independently-discovered fix landed alongside this: Ollama
+  calls were unnecessarily detouring through the system VPN's SOCKS proxy
+  (since `httpx` trusts `HTTP(S)_PROXY` env vars by default) -- both the
+  Groq and Ollama `AsyncOpenAI` clients in `agent/llm_client.py` now pass
+  an explicit `httpx.AsyncClient(trust_env=False)`, so local traffic never
+  takes that detour regardless of what's set in the shell. See "Known
+  environment gotchas" for the full SOCKS proxy / `httpx2` / national
+  bandwidth throttling investigation this surfaced.
+- A second UX fix landed alongside this too: `handlers/user_handlers.py`
+  now keeps Telegram's "typing..." indicator alive for the full duration
+  of a turn (refreshed every 4s, since Telegram's own indicator expires
+  after ~5s) via a background task cancelled in a `finally` block -- turns
+  that legitimately take tens of seconds (a throttled network path, a
+  multi-round tool call) no longer go silently quiet partway through.
+
+Covered by `test/test_rate_limiter.py` (7 tests): limit enforcement,
+rejected calls not counting further against the user, sliding-window
+aging (both full and partial), per-user isolation, and concurrency safety
+(50 simultaneous calls for one user never overshoot the limit). Full
+suite verified at 107/107 (`python -m pytest . -v`) on Moeid's Windows
+venv, and manually against the live bot.
+
+---
+
+## Order status beyond confirmed/rejected (utils/order_manager.py, handlers/admin_handlers.py, agent/tools.py) — built, was "Not built yet" item 2
+An optional status tail on top of the already-hardened
+`pending_confirmation -> awaiting_review -> confirmed/rejected` lifecycle:
+
+```
+confirmed -> shipped -> delivered
+```
+
+- `utils/order_manager.py`: new `advance_order_status(order_id,
+  new_status)`, a forward-only transition guard mirroring
+  `set_order_status_if_not`'s atomic check-and-set shape (`_orders_lock`).
+  Refuses skipping a step (confirmed straight to delivered), acting on an
+  order in the wrong state (shipping something still awaiting payment), or
+  double-advancing an already-shipped order -- returns a clear reason
+  instead of a silent no-op. New `get_latest_order_for_user(user_id)`, an
+  unfiltered-by-status lookup (unlike `get_latest_unpaid_order`) so a
+  customer can ask about an order that's already past the payment stage.
+- `handlers/admin_handlers.py`: new `/ship <order_id>` and
+  `/deliver <order_id>` commands, gated by the existing
+  `AdminOnlyMiddleware` for free (router-level). Each DMs the customer on
+  success; a refused transition sends no customer DM. `_format_payment_status`
+  now labels `shipped` ("📦 Shipped") and `delivered` ("✅ Delivered")
+  explicitly; `confirmed`/`rejected` formatting is unchanged.
+  `/pending_orders` stays scoped to `pending_confirmation`/`awaiting_review`
+  only, by design -- a shipped/delivered order drops out of that list and
+  is only visible via individual lookup (`check_order_status` on the
+  customer side; there's no admin lookup-by-id command today).
+- `agent/tools.py`: new `check_order_status` tool so the agent can answer
+  "where's my order?" instead of guessing. Includes an explicit ownership
+  check -- a model-supplied `order_id` is verified to actually belong to
+  the requesting `user_id` before anything is returned, so a hallucinated
+  or guessed id can't leak another customer's order.
+- `agent/prompts.py`: new rule directing the model to call
+  `check_order_status` rather than invent a status, shipping date, or
+  delivery window.
+
+Covered by `test/test_order_status.py` (20 tests): the transition guard
+(happy path, every invalid-transition case, double-advance refusal,
+order-not-found), `get_latest_order_for_user`, both admin commands
+end-to-end, the new status labels, and `check_order_status` (own order by
+id, latest order with no id given, the cross-user ownership block, no
+orders, unknown id). Full suite verified at 130/130, and manually against
+the live bot.
+
+---
+
+## Fuzzy product search (utils/inventory_manager.py) — built, was "Not built yet" item 3
+`search_products()` now tolerates typos ("jordam", "hoody") instead of
+returning zero results, closing the "by design" substring-only limitation
+previously documented in the README.
+
+- Tries the existing exact substring match first, completely unchanged.
+  Only when that returns zero results for a non-empty query does it fall
+  back to a new token-level fuzzy match (`_fuzzy_search()`), so an exact
+  hit can never be demoted or interfered with.
+- Stdlib `difflib.SequenceMatcher` -- no new dependency, same
+  no-new-dependency reasoning `utils/file_io.py` already used for choosing
+  `asyncio.to_thread()` over `aiofiles`. Each query word is scored against
+  its single best-matching word in a product's combined
+  name/description/category text; a product's overall score is the
+  average of its per-word best matches, and results are ranked by score.
+  Punctuation attached to a word (a trailing comma from a description
+  sentence) is stripped from both query and haystack tokens before
+  scoring, so it can't artificially lower a match.
+- `config.FUZZY_SEARCH_THRESHOLD` (default `0.7`, `.env`-tunable) is the
+  minimum per-word score to count as a match -- calibrated against real
+  typo patterns (single-letter substitutions, transpositions,
+  missing/extra letters on product-name-length words score 0.73-0.92)
+  while keeping genuinely unrelated words (~0.5 or below) safely excluded.
+
+Covered by `test/test_fuzzy_search.py` (16 tests): exact-match priority
+and regression, core typo cases, threshold precision, category-filter
+interaction, result ranking, and punctuation-stripping. Full suite
+verified at 146/146, and manually against the live bot with real typo'd
+queries.
+
+---
+
+## Product images (handlers/channel_images.py, utils/inventory_manager.py) — built, was "Not built yet" item 4
+A private, bot-admin Telegram channel used as a seller-facing image-upload
+gallery, supporting both a default photo per product and per-color photos.
+
+- `handlers/channel_images.py` (new): posting a photo captioned with a
+  product id ("p001" or "#p001") sets that product's default photo;
+  adding a color as a second caption word ("p002 black") sets that
+  color's specific photo instead. The color is validated against the
+  product's own real variant colors (exact, case-insensitive match -- same
+  convention as the existing color-matching fix, bug-audit issue 3.2) and
+  rejected with the valid colors listed if it doesn't match. One photo per
+  post only -- media-group/album posts are ignored with a warning, since
+  Telegram doesn't reliably attach a caption to every photo in a group.
+  Last write always wins per field; no history/versioning. Trust model:
+  Telegram only delivers `channel_post` updates for channels the bot is an
+  ADMIN of, and only channel admins/owners can post there to begin with --
+  `config.PRODUCT_IMAGES_CHANNEL_ID` is a belt-and-suspenders identity
+  check, not the actual security boundary.
+- `utils/inventory_manager.py`: products may have `image` (the
+  default/fallback photo) and `images_by_color` (a dict of
+  color -> file_id/URL). Both a Telegram file_id and a plain URL work
+  identically anywhere a photo is sent. New `set_product_image(product_id,
+  image, color=None)` (locked, atomic) and `get_image_for_color(product,
+  color)`, which resolves an exact color match if one exists, else the
+  default, else nothing -- and tells the caller which case occurred, so
+  callers can be honest about whether a color-specific photo was actually
+  found. `search_products()` results carry a derived `has_image` boolean
+  (true if either field is set) and never the raw image data itself.
+- `agent/tools.py`: `get_product_details` gains an optional `color`
+  argument. Fixes a real latent bug caught via direct testing before this
+  shipped: a product resolved through the name/fuzzy-search fallback path
+  (rather than a direct id lookup) is a search-result shallow copy with
+  image fields already stripped -- `_get_product_details` now re-fetches
+  the raw stored product by its resolved id before resolving a photo, so a
+  product found by name doesn't incorrectly appear imageless.
+- `agent/agent.py`: a `product_image` event (customer-facing, not an admin
+  notification -- a deliberate extension of the previously admin-only
+  events mechanism) fires when `get_product_details` resolves an image,
+  carrying the image, product name, and resolved color (if any). Added
+  inline at all three tool-result-processing sites to match this
+  project's existing duplication convention, not factored into a shared
+  helper.
+- `handlers/user_handlers.py`: the customer-facing photo caption includes
+  the color when one was actually matched ("Test Hoodie (black)"),
+  falling back to just the product name otherwise. Failure-tolerant -- a
+  broken/expired file_id is caught and logged, never crashes the turn.
+- `agent/prompts.py`: tells the model to mention photo availability when
+  search results include `has_image` items, to pass `color` when the
+  customer names one, and to be explicit when a result's image has no
+  matching `image_color` (i.e. it's the general photo, not necessarily the
+  color asked about) rather than implying a match that didn't happen.
+- `config.py`: new `PRODUCT_IMAGES_CHANNEL_ID`, same shape as
+  `ADMIN_GROUP_ID`.
+
+Covered by `test/test_product_images.py` (~35 tests): caption parsing for
+both formats, default vs. color-specific storage and validation,
+`get_image_for_color`'s resolution/fallback logic, `has_image` without
+leaking raw image data, the channel handler end-to-end, `get_product_details`'s
+color resolution including the name-fallback re-fetch regression test, the
+customer-facing send's color-aware caption, and full `run_agent`
+integration. Full suite verified at 181/181, and manually against the
+live bot: channel uploads save colors correctly, and the bot sends the
+right photo to the right customer request.
 
 ## Working conventions
 - **Whole-file replacement over diff-patching.** Patches (`git am`, inline
