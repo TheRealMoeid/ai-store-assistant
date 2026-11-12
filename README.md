@@ -1,5 +1,7 @@
 # Shopmate an AI Sales Agent for Telegram
 
+[![Tests](https://github.com/TheRealMoeid/ai-store-assistant/actions/workflows/tests.yml/badge.svg)](https://github.com/TheRealMoeid/ai-store-assistant/actions/workflows/tests.yml)
+
 ## 1. Project Overview
 
 **Shopmate** (AI Store Assistant) is a lightweight, conversational AI sales agent for Telegram, powered by an LLM tool-calling loop. It allows customers to browse inventory, check stock, manage a shopping cart, place orders, track order status, and submit payment proof using natural language.

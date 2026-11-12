@@ -1,0 +1,60 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      # Matches docs/CLAUDE.md's documented recommendation: `python -m pytest`
+      # rather than bare `pytest`, since bare `pytest . -v` has previously
+      # failed to collect test/test_admin_auth.py on Windows with
+      # ModuleNotFoundError (the module's own sys.path.insert isn't enough
+      # unless the interpreter itself is invoked the same way).
+      - name: Run test suite
+        run: python -m pytest . -v
+
+      # This project has a documented history of standalone/manual test runs
+      # accidentally writing to the real, git-tracked data/*.json files (see
+      # "Known environment gotchas" in docs/CLAUDE.md -- 50 synthetic orders
+      # once made it into data/orders.json this way). Every current test file
+      # sandboxes its own config paths to a throwaway test_data/ directory,
+      # so a clean run should leave data/ completely untouched. This step
+      # fails the build if a future test (or test helper) forgets to do that,
+      # catching the mistake here instead of in a real commit.
+      - name: Check for accidental data/ mutations
+        shell: bash
+        run: |
+          git diff --exit-code -- data/ || {
+            echo "::error::The test run modified tracked data/*.json files -- a test may be writing to real data instead of a sandboxed test_data/ directory. See docs/CLAUDE.md's 'Known environment gotchas' section."
+            exit 1
+          }
