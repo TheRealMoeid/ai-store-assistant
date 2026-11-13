@@ -23,8 +23,8 @@ reintroduce.
 
 The fix: _load_if_changed()'s inner open()/json.load() now calls
 file_io.read_json_sync() instead, so it gets the same bounded,
-exponential-backoff PermissionError retry as every other reader. The
-outer mtime check (config.INVENTORY_FILE.stat().st_mtime) is unchanged.
+exponential-backoff PermissionError retry as every other reader. The outer
+mtime check (config.INVENTORY_FILE.stat().st_mtime) is unchanged.
 
 This suite verifies the fix directly by simulating the real Windows race:
 patching builtins.open to raise PermissionError a bounded number of times
@@ -36,6 +36,7 @@ matching the project's established pattern, so real data/inventory.json
 is never touched.
 """
 import sys
+import os
 import builtins
 from pathlib import Path
 
@@ -181,8 +182,14 @@ def test_load_if_changed_still_reloads_on_real_inventory_edit():
     Regression check for the mtime-based cache invalidation itself (not
     touched by this fix): editing the file for real (as the seller would,
     by hand) must still be picked up on the next call.
+
+    The rewrite is followed by an explicit os.utime() so the mtime is
+    guaranteed to differ from the cached one. Without this, two writes
+    within the same filesystem timestamp tick (common on CI runners) leave
+    the mtime unchanged and the cache correctly-but-unhelpfully stays put.
     """
     inventory_manager._load_if_changed()  # warm the cache
+    original_mtime = config.INVENTORY_FILE.stat().st_mtime
 
     updated = {
         "products": [
@@ -194,6 +201,9 @@ def test_load_if_changed_still_reloads_on_real_inventory_edit():
     }
     with open(config.INVENTORY_FILE, "w") as f:
         json.dump(updated, f)
+
+    later = original_mtime + 2  # well past any filesystem's timestamp granularity
+    os.utime(config.INVENTORY_FILE, (later, later))
 
     products = inventory_manager._load_if_changed()
     assert products[0]["variants"][0]["stock"] == 999
