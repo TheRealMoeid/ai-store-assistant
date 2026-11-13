@@ -47,3 +47,5 @@ dist/
 
 *.patch
 /patch
+
+check_llm_client.py
